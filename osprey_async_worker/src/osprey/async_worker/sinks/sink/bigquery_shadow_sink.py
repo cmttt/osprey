@@ -58,12 +58,20 @@ class AsyncBigQueryShadowSink(AsyncBaseOutputSink):
         sample_rate: float = DEFAULT_SAMPLE_RATE,
         allowed_actions: Optional[Set[str]] = None,
     ):
-        self._publisher = PubSubPublisher(
-            project_id=project_id,
-            topic_id=topic_id,
-        )
+        self._project_id = project_id
+        self._topic_id = topic_id
+        self._publisher: PubSubPublisher | None = None
         self._sample_rate = sample_rate
         self._allowed_actions = allowed_actions
+
+    def _get_publisher(self) -> PubSubPublisher:
+        """Lazy init — must be created after gevent patches threading (if applicable)."""
+        if self._publisher is None:
+            self._publisher = PubSubPublisher(
+                project_id=self._project_id,
+                topic_id=self._topic_id,
+            )
+        return self._publisher
 
     def will_do_work(self, result: ExecutionResult) -> bool:
         if self._allowed_actions is not None and result.action.action_name not in self._allowed_actions:
@@ -111,7 +119,7 @@ class AsyncBigQueryShadowSink(AsyncBaseOutputSink):
                 trace_id=trace_id,
                 rule_audit_entries=rule_audit_entries,
             )
-            self._publisher.publish(event)
+            self._get_publisher().publish(event)
             metrics.increment('bigquery_shadow_sink.push.success')
         except Exception as e:
             logger.error(f'Exception in BigQuery shadow sink: {e}')
@@ -122,5 +130,6 @@ class AsyncBigQueryShadowSink(AsyncBaseOutputSink):
             sentry_sdk.capture_exception(e)
 
     async def stop(self) -> None:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._publisher.stop)
+        if self._publisher is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._publisher.stop)
