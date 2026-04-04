@@ -6,6 +6,7 @@ Also loads sync plugins from 'osprey_plugin' for UDFs (wrapped in adapters).
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Sequence, Type
 
@@ -100,6 +101,7 @@ def _bootstrap_labels_provider(config: 'Config | None') -> LabelsProvider | None
     try:
         provider_or_service = plugin_manager.hook.register_labels_service_or_provider(config=config)
     except Exception:
+        logging.exception('Failed to register labels service/provider')
         return None
     if provider_or_service is None:
         return None
