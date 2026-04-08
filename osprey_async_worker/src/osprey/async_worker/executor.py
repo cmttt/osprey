@@ -64,20 +64,15 @@ def _get_ready_sync_and_async(
     return _ready_sync, _ready_async
 
 
-# Always suppressed — these are control flow, not real errors.
-_ALWAYS_SUPPRESS = (NodeFailurePropagationException, ExpectedUdfException)
-# Only suppressed in production — useful to see in staging for debugging.
-_SUPPRESS_IN_PROD_ONLY = (MissingJsonPath, TypeError)
+_SUPPRESS_IN_PROD = (ExpectedUdfException, NodeFailurePropagationException, MissingJsonPath, TypeError)
 
 
 def _is_spammy_exception(e: Optional[Exception]) -> bool:
     if e is None:
         return True
-    if isinstance(e, _ALWAYS_SUPPRESS):
-        return True
     if os.environ.get('ENVIRONMENT') in ('staging', 'development'):
         return False
-    return isinstance(e, _SUPPRESS_IN_PROD_ONLY)
+    return isinstance(e, _SUPPRESS_IN_PROD)
 
 
 def _get_metric_tags(
