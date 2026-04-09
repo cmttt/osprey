@@ -11,6 +11,7 @@ import asyncio
 from typing import Optional
 
 import aiodns
+import pycares
 from osprey.async_worker.adaptor.interfaces import AsyncUDFBase
 from osprey.engine.executor.execution_context import ExecutionContext, ExpectedUdfException
 from osprey.engine.stdlib.udfs.mx_lookup import Arguments
@@ -44,7 +45,7 @@ class MXLookup(AsyncUDFBase[Arguments, str]):  # type: ignore[misc]
             mx_result = await resolver.query_dns(arguments.domain, 'MX')
             best_mx = sorted(mx_result.answer, key=lambda r: r.data.priority)[0].data.exchange
             a_result = await resolver.query_dns(best_mx, 'A')
-        except aiodns.error.DNSError:
+        except (aiodns.error.DNSError, pycares.AresError):
             raise ExpectedUdfException()
 
         a_records = [r for r in a_result.answer if hasattr(r.data, 'addr')]
