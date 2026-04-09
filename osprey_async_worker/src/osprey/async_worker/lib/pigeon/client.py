@@ -476,6 +476,7 @@ class AsyncUnaryUnaryRpcCallable(Generic[T, Request, Response]):
                     and try_count < retry_policy['max_secondaries_to_retry']
                 ):
                     try_count += 1
+                    await asyncio.sleep(0.5 * try_count)
                     continue
 
                 raise e
