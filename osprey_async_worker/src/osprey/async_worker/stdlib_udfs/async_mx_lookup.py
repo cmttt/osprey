@@ -47,4 +47,7 @@ class MXLookup(AsyncUDFBase[Arguments, str]):  # type: ignore[misc]
         except aiodns.error.DNSError:
             raise ExpectedUdfException()
 
-        return min(r.data.addr for r in a_result.answer)
+        a_records = [r for r in a_result.answer if hasattr(r.data, 'addr')]
+        if not a_records:
+            raise ExpectedUdfException()
+        return min(r.data.addr for r in a_records)
