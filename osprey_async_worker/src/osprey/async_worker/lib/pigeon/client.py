@@ -457,6 +457,15 @@ class AsyncUnaryUnaryRpcCallable(Generic[T, Request, Response]):
                     # ran out of secondaries to try
                     raise last_exception
 
+                if (
+                    retry_policy
+                    and try_count < retry_policy['max_secondaries_to_retry']
+                ):
+                    # Retry ServiceUnavailable (empty ring at startup) with backoff
+                    try_count += 1
+                    await asyncio.sleep(0.5 * try_count)
+                    continue
+
                 raise e
             except RPCException as e:
                 last_exception = e
