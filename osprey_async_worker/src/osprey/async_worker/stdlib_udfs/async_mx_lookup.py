@@ -43,7 +43,10 @@ class MXLookup(AsyncUDFBase[Arguments, str]):  # type: ignore[misc]
         resolver = _get_resolver()
         try:
             mx_result = await resolver.query_dns(arguments.domain, 'MX')
-            best_mx = sorted(mx_result.answer, key=lambda r: r.data.priority)[0].data.exchange
+            mx_records = [r for r in mx_result.answer if hasattr(r.data, 'priority')]
+            if not mx_records:
+                raise ExpectedUdfException()
+            best_mx = sorted(mx_records, key=lambda r: r.data.priority)[0].data.exchange
             a_result = await resolver.query_dns(best_mx, 'A')
         except (aiodns.error.DNSError, pycares.AresError):
             raise ExpectedUdfException()
