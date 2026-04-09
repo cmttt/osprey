@@ -102,6 +102,7 @@ class RoutedClient(Generic[T]):
         baggage=None,
         envoy_endpoint: Optional[ServiceDefinition] = None,
         use_peer_service_name=False,
+        default_retry_policy: Optional['RetryPolicy'] = None,
     ):
         self._service_name = service_name
         self._peer_service = f'{service_name}-client' if use_peer_service_name else service_name
@@ -119,6 +120,7 @@ class RoutedClient(Generic[T]):
         self._grpc_options = list(grpc_options.items())
         self._connect_eagerly = False
         self._acceptable_duration_ms: Optional[int] = acceptable_duration_ms
+        self._default_retry_policy: Optional['RetryPolicy'] = default_retry_policy
         self._interceptors: List[Any] = [BaggageInterceptor(baggage_header=baggage_header, baggage=baggage)]
 
         if metadata:
@@ -435,6 +437,7 @@ class AsyncUnaryUnaryRpcCallable(Generic[T, Request, Response]):
         metadata: Optional[List[Tuple[str, str]]] = None,
         retry_policy: Optional[RetryPolicy] = None,
     ) -> Response:
+        retry_policy = retry_policy or self.client._default_retry_policy
         try_count = 0
         last_exception = None
         while True:
