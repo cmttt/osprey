@@ -131,12 +131,21 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
     async def _handle_event(self, event) -> None:
         """Handle an etcd event by updating sources and notifying watchers."""
         sources_dict = self._parse_event(event)
+        new_sources = Sources.from_dict(sources_dict)
+
+        # Etcd watcher reconnects and session refreshes re-deliver the current
+        # value as a FullSyncOne event, so we see many events where the
+        # content is unchanged. Skip recompile when the sources hash matches
+        # what we already have — recompile transiently doubles peak memory and
+        # can push pods over the OOM line.
+        if self._current_sources is not None and new_sources.hash() == self._current_sources.hash():
+            return
 
         if self._input_stream_ready_signaler is not None:
             logging.info('Pausing input streams')
             await self._input_stream_ready_signaler.pause_input_stream()
 
-        self._current_sources = Sources.from_dict(sources_dict)
+        self._current_sources = new_sources
         if self._sources_watcher_callback:
             self._sources_watcher_callback()
 
