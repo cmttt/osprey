@@ -80,6 +80,11 @@ class _DogStatsd(DogStatsd):
             max_buffer_size=max_buffer_size,  # type:ignore
             constant_tags=constant_tags,
             use_ms=use_ms,
+            # Pack multiple metrics per datagram. Default (disable_buffering=True) sends one
+            # UDP packet per metric, which overruns the DD agent's socket recv buffer at
+            # high emission rates and causes silent kernel drops. max_buffer_len auto-selects
+            # 1432 bytes for UDP / 8192 for UDS.
+            disable_buffering=False,
         )
         self.prefix = None
         self.debug = False
