@@ -134,11 +134,8 @@ class AsyncRulesSink:
                     action_tags = [f'action:{action.action_name}']
                     metrics.increment('rules_sink.input_action_received', tags=action_tags)
 
-                    if action.data.get('osprey_skip_async_classification', False):
-                        metrics.increment('rules_sink.skipped', tags=action_tags + ['reason:osprey_skip_async_classification'])
-                        continue
                     if action.data.get('osprey_skip_async', False):
-                        metrics.increment('rules_sink.skipped', tags=action_tags + ['reason:osprey_skip_async'])
+                        metrics.increment('rules_sink.skipped', tags=action_tags)
                         continue
 
                     with tracer.start_span('osprey.async.classify_one', child_of=None) as span:
