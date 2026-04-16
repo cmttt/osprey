@@ -6,6 +6,7 @@ import os
 import weakref
 from collections import defaultdict
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from time import time_ns
 from typing import Any, Dict, Generic, List, Optional, Set, Tuple, Type, TypeVar, Union, cast
@@ -282,18 +283,26 @@ class RoutedClient(Generic[T]):
             set_protocol(span)
             routing_values_iter = iter(routing_values)
             final_response = None
-            while True:
-                routing_values_chunk = list(itertools.islice(routing_values_iter, 0, self._chunk_size))
-                if not routing_values_chunk:
-                    break
+            # Hold activity across the full routed request so idle eviction cannot
+            # drop and recreate the channel between chunk RPCs for the same service.
+            with self._hold_service_activity(service):
+                while True:
+                    routing_values_chunk = list(itertools.islice(routing_values_iter, 0, self._chunk_size))
+                    if not routing_values_chunk:
+                        break
 
-                next_message = _make_message(message_template, request_field, routing_values, routing_values_chunk)
-                response = await self._invoke_service_method(
-                    service, method_name, next_message, timeout=timeout, metadata=metadata
-                )
-                if not final_response:
-                    final_response = response.__class__()
-                final_response.MergeFrom(response)
+                    next_message = _make_message(message_template, request_field, routing_values, routing_values_chunk)
+                    response = await self._invoke_service_method(
+                        service,
+                        method_name,
+                        next_message,
+                        timeout=timeout,
+                        metadata=metadata,
+                        track_activity=False,
+                    )
+                    if not final_response:
+                        final_response = response.__class__()
+                    final_response.MergeFrom(response)
 
             return final_response
 
@@ -384,6 +393,16 @@ class RoutedClient(Generic[T]):
             self._cleanup_client(service_key)
             metrics.increment('pigeon.channel_evictions', tags=[f'service:{self._service_name}'])
 
+    @contextmanager
+    def _hold_service_activity(self, service: Service):
+        key = self._get_service_key(service)
+        self._client_active_requests[key] += 1
+        self._client_last_used_ns[key] = time_ns()
+        try:
+            yield
+        finally:
+            self._release_service_activity(key)
+
     async def _invoke_service_method(
         self,
         service: Service,
@@ -391,16 +410,31 @@ class RoutedClient(Generic[T]):
         message: Message,
         timeout: Optional[float] = None,
         metadata: Optional[List[Tuple[str, str]]] = None,
+        track_activity: bool = True,
     ):
         key = self._get_service_key(service)
         client = self._get_client(service)
         method = getattr(client, method_name)
-        self._client_active_requests[key] += 1
-        self._client_last_used_ns[key] = time_ns()
+        if track_activity:
+            self._client_active_requests[key] += 1
+            self._client_last_used_ns[key] = time_ns()
         try:
             return await method(message, timeout=timeout, metadata=metadata)
         finally:
-            self._client_active_requests[key] -= 1
+            if track_activity:
+                self._release_service_activity(key)
+
+    def _release_service_activity(self, key: Tuple[Tuple[str, Optional[str]], int]) -> None:
+        active_requests = self._client_active_requests.get(key)
+        if active_requests is None:
+            return
+
+        if active_requests <= 1:
+            self._client_active_requests.pop(key, None)
+        else:
+            self._client_active_requests[key] = active_requests - 1
+
+        if key in self._clients:
             self._client_last_used_ns[key] = time_ns()
 
     @staticmethod

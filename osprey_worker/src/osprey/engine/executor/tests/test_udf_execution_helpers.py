@@ -106,3 +106,11 @@ def test_lazy_helper_factory_creates_helper_once(execute: ExecuteFunction) -> No
 
     assert 1 == data['r1'] == data['r2']
     assert len(created) == 2
+
+
+def test_missing_helper_raises_descriptive_error() -> None:
+    helpers = UDFHelpers()
+    udf = object.__new__(CountingCallsUDF1)
+
+    with pytest.raises(KeyError, match='No helper or helper factory registered for CountingCallsUDF1'):
+        helpers.get_udf_helper(udf)

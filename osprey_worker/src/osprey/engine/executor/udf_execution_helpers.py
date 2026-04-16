@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable, Dict, Generic, Hashable, Type, TypeVar, cast
 
 from osprey.engine.executor.external_service_utils_base import ExternalService
@@ -40,6 +41,7 @@ class UDFHelpers:
     def __init__(self) -> None:
         self._helpers: Dict[Type[HasHelperInternal[Any]], object] = {}
         self._helper_factories: Dict[Type[HasHelperInternal[Any]], Callable[[], object]] = {}
+        self._helper_creation_lock = Lock()
 
     def set_udf_helper(self, udf_class: Type[HasHelperInternal[HelperT]], helper: HelperT) -> 'UDFHelpers':
         self._helpers[udf_class] = helper
@@ -58,5 +60,13 @@ class UDFHelpers:
     def get_udf_helper(self, udf: HasHelperInternal[HelperT]) -> HelperT:
         udf_class = type(udf)
         if udf_class not in self._helpers:
-            self._helpers[udf_class] = self._helper_factories[udf_class]()
+            helper_factory = self._helper_factories.get(udf_class)
+            if helper_factory is None:
+                raise KeyError(f'No helper or helper factory registered for {udf_class.__qualname__}')
+
+            # Lazy helper creation may race across threads in some test/runtime setups.
+            # Double-checked locking keeps the factory single-shot in the common case.
+            with self._helper_creation_lock:
+                if udf_class not in self._helpers:
+                    self._helpers[udf_class] = helper_factory()
         return cast(HelperT, self._helpers[udf_class])
