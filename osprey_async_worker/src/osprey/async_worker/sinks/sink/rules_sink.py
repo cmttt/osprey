@@ -21,6 +21,7 @@ from osprey.worker.sinks.utils.acking_contexts_base import BaseAckingContext, Ve
 from osprey.async_worker.adaptor.interfaces import AsyncBaseOutputSink
 from osprey.async_worker.engine import AsyncOspreyEngine
 from osprey.async_worker.executor import execute as async_execute
+from osprey.async_worker.lib.coordinator_input_stream import AsyncVerdictsAckingContext
 from osprey.async_worker.sinks.sink.input_stream import AsyncBaseInputStream
 
 logger = logging.getLogger(__name__)
@@ -129,8 +130,6 @@ class AsyncRulesSink:
     async def run(self) -> None:
         async for message_context in self._input_stream:
             try:
-                action_tags: Optional[list[str]] = None
-                classify_done: Optional[float] = None
                 with message_context as action:
                     action_tags = [f'action:{action.action_name}']
                     metrics.increment('rules_sink.input_action_received', tags=action_tags)
@@ -154,7 +153,11 @@ class AsyncRulesSink:
                             tag='sink:async-rules-sink',
                             parent_tracer_span=span,
                         )
-                        classify_done = time.monotonic()
+
+                        # Stamp classify_done on the context so _gen() can measure
+                        # the real classify -> ack-enqueue latency after yield returns.
+                        if isinstance(message_context, AsyncVerdictsAckingContext):
+                            message_context.classify_done_ts = time.monotonic()
 
                         if isinstance(message_context, VerdictsAckingContext):
                             if result is None:
@@ -164,16 +167,6 @@ class AsyncRulesSink:
                                 metrics.increment('rules_sink.captured_verdicts')
 
                         info_log_osprey_action(action.action_id, action.action_name, 'async classify_one complete')
-
-                # Measure time from classify completion to after the context manager exits.
-                # The ack is sent in message_context.__exit__(), so this captures the real
-                # classify-done -> ack-enqueued boundary instead of the pre-exit gap.
-                if action_tags is not None and classify_done is not None:
-                    metrics.histogram(
-                        'osprey_coordinator_input_stream.classify_to_ack_enqueue_ms',
-                        (time.monotonic() - classify_done) * 1000,
-                        tags=action_tags,
-                    )
             except asyncio.CancelledError:
                 return
             except Exception as e:

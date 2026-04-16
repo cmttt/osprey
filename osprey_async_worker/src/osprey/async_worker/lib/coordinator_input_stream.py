@@ -53,6 +53,7 @@ class AsyncVerdictsAckingContext(VerdictsAckingContext[OspreyEngineAction]):
         super().__init__(item)
         self._stream = stream
         self._ack_id = ack_id
+        self.classify_done_ts: Optional[float] = None
 
 
 class GrpcConnectionDiscoveryPool:
@@ -438,7 +439,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                         osprey_coordinator_action.action_name,
                         "nacking (couldn't create OspreyEngineAction)",
                     )
-                    await bidirectional_stream.send_ack_or_nack(ack_id, ack=False)
+                    bidirectional_stream.send_ack_or_nack(ack_id, ack=False)
                     continue
 
                 context: AsyncVerdictsAckingContext = AsyncVerdictsAckingContext(
@@ -450,6 +451,10 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                     use_ms=True,
                 ):
                     yield context
+
+                # --- ack-path metrics: measure the real boundary ---
+                yield_resume_ts = time.monotonic()
+                action_tags = [f'action_name:{osprey_engine_action.action_name}']
 
                 # Prioritize shutdown so we can ack the last action and disconnect gracefully
                 if self._shutdown_event.is_set():
@@ -464,7 +469,22 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                     break
 
                 # Normal path: ack the last action and request the next one
-                await bidirectional_stream.send_ack_or_nack(ack_id, verdicts=context.get_verdicts())
+                bidirectional_stream.send_ack_or_nack(ack_id, verdicts=context.get_verdicts())
+
+                # Emit ack-path latency metrics at the real enqueue boundary
+                ack_done_ts = time.monotonic()
+                metrics.histogram(
+                    'osprey_coordinator_input_stream.yield_resume_to_ack_enqueue_ms',
+                    (ack_done_ts - yield_resume_ts) * 1000,
+                    tags=action_tags,
+                )
+                if context.classify_done_ts is not None:
+                    metrics.histogram(
+                        'osprey_coordinator_input_stream.classify_to_ack_enqueue_ms',
+                        (ack_done_ts - context.classify_done_ts) * 1000,
+                        tags=action_tags,
+                    )
+
                 info_log_osprey_action(
                     osprey_coordinator_action.action_id, osprey_coordinator_action.action_name, 'acking'
                 )
