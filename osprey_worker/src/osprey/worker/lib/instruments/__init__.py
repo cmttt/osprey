@@ -85,6 +85,13 @@ class _DogStatsd(DogStatsd):
             # high emission rates and causes silent kernel drops. max_buffer_len auto-selects
             # 1432 bytes for UDP / 8192 for UDS.
             disable_buffering=False,
+            # Client-side aggregation of counters/gauges/sets: collapses repeated
+            # increment('foo', tags=T) calls on the same (metric, tags) within a flush
+            # window into a single send. At ~1.5k action/s/process emitting ~100 distinct
+            # (metric, action-tag) combos, this cuts counter-packet rate by ~30x without
+            # changing the aggregated total the agent sees. Histograms and timings are
+            # untouched — they still emit every sample so percentiles stay accurate.
+            disable_aggregation=False,
         )
         self.prefix = None
         self.debug = False
