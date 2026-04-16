@@ -2,9 +2,11 @@ import asyncio
 import copy
 import itertools
 import logging
+import os
 import weakref
 from collections import defaultdict
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from time import time_ns
 from typing import Any, Dict, Generic, List, Optional, Set, Tuple, Type, TypeVar, Union, cast
@@ -112,10 +114,13 @@ class RoutedClient(Generic[T]):
         self._routing_type = routing_type
         self._open_channels: Dict[Tuple[Tuple[str, Optional[str]], int], weakref.ReferenceType[grpc.aio.Channel]] = {}
         self._clients: Dict[Tuple[Tuple[str, Optional[str]], int], T] = {}
+        self._client_last_used_ns: Dict[Tuple[Tuple[str, Optional[str]], int], int] = {}
+        self._client_active_requests: Dict[Tuple[Tuple[str, Optional[str]], int], int] = defaultdict(int)
         self._secondaries = secondaries
         self._chunk_size = chunk_size
         self._semaphore = asyncio.Semaphore(pool_size)
         self._read_timeout = read_timeout
+        self._channel_idle_timeout_ns = _get_idle_timeout_ns()
         grpc_options = {'grpc.keepalive_time_ms': 300_000, **(grpc_options or dict())}
         self._grpc_options = list(grpc_options.items())
         self._connect_eagerly = False
@@ -187,6 +192,7 @@ class RoutedClient(Generic[T]):
         instances_to_skip: int = 0,
     ):
         await self._ensure_watcher_initialized()
+        self._evict_idle_clients()
         routing_type = routing_type if routing_type is not None else self._routing_type
         request_field = request_field if request_field is not None else self._request_field
         timeout = timeout or self._read_timeout
@@ -259,9 +265,7 @@ class RoutedClient(Generic[T]):
     ):
         """Request from a remote service."""
         service = self._select_service(message, request_field, routing_type, instances_to_skip)
-        client = self._get_client(service)
-        method = getattr(client, method_name)
-        return await method(message, timeout=timeout, metadata=metadata)
+        return await self._invoke_service_method(service, method_name, message, timeout=timeout, metadata=metadata)
 
     async def _do_routed_request(
         self,
@@ -277,20 +281,28 @@ class RoutedClient(Generic[T]):
         with maybe_start_span('pigeon.routed_request', self._peer_service, method_name):
             span = current_span()
             set_protocol(span)
-            client = self._get_client(service)
-            method = getattr(client, method_name)
             routing_values_iter = iter(routing_values)
             final_response = None
-            while True:
-                routing_values_chunk = list(itertools.islice(routing_values_iter, 0, self._chunk_size))
-                if not routing_values_chunk:
-                    break
+            # Hold activity across the full routed request so idle eviction cannot
+            # drop and recreate the channel between chunk RPCs for the same service.
+            with self._hold_service_activity(service):
+                while True:
+                    routing_values_chunk = list(itertools.islice(routing_values_iter, 0, self._chunk_size))
+                    if not routing_values_chunk:
+                        break
 
-                next_message = _make_message(message_template, request_field, routing_values, routing_values_chunk)
-                response = await method(next_message, timeout=timeout, metadata=metadata)
-                if not final_response:
-                    final_response = response.__class__()
-                final_response.MergeFrom(response)
+                    next_message = _make_message(message_template, request_field, routing_values, routing_values_chunk)
+                    response = await self._invoke_service_method(
+                        service,
+                        method_name,
+                        next_message,
+                        timeout=timeout,
+                        metadata=metadata,
+                        track_activity=False,
+                    )
+                    if not final_response:
+                        final_response = response.__class__()
+                    final_response.MergeFrom(response)
 
             return final_response
 
@@ -364,6 +376,66 @@ class RoutedClient(Generic[T]):
                     pass  # No running event loop (shutdown or non-main thread)
         if service_key in self._clients:
             del self._clients[service_key]
+        self._client_last_used_ns.pop(service_key, None)
+        self._client_active_requests.pop(service_key, None)
+        metrics.gauge('pigeon.open_channels', len(self._clients), tags=[f'service:{self._service_name}'])
+
+    def _evict_idle_clients(self) -> None:
+        if self._channel_idle_timeout_ns <= 0 or not self._clients:
+            return
+
+        now_ns = time_ns()
+        for service_key, last_used_ns in list(self._client_last_used_ns.items()):
+            if self._client_active_requests.get(service_key, 0) > 0:
+                continue
+            if now_ns - last_used_ns < self._channel_idle_timeout_ns:
+                continue
+            self._cleanup_client(service_key)
+            metrics.increment('pigeon.channel_evictions', tags=[f'service:{self._service_name}'])
+
+    @contextmanager
+    def _hold_service_activity(self, service: Service):
+        key = self._get_service_key(service)
+        self._client_active_requests[key] += 1
+        self._client_last_used_ns[key] = time_ns()
+        try:
+            yield
+        finally:
+            self._release_service_activity(key)
+
+    async def _invoke_service_method(
+        self,
+        service: Service,
+        method_name: str,
+        message: Message,
+        timeout: Optional[float] = None,
+        metadata: Optional[List[Tuple[str, str]]] = None,
+        track_activity: bool = True,
+    ):
+        key = self._get_service_key(service)
+        client = self._get_client(service)
+        method = getattr(client, method_name)
+        if track_activity:
+            self._client_active_requests[key] += 1
+            self._client_last_used_ns[key] = time_ns()
+        try:
+            return await method(message, timeout=timeout, metadata=metadata)
+        finally:
+            if track_activity:
+                self._release_service_activity(key)
+
+    def _release_service_activity(self, key: Tuple[Tuple[str, Optional[str]], int]) -> None:
+        active_requests = self._client_active_requests.get(key)
+        if active_requests is None:
+            return
+
+        if active_requests <= 1:
+            self._client_active_requests.pop(key, None)
+        else:
+            self._client_active_requests[key] = active_requests - 1
+
+        if key in self._clients:
+            self._client_last_used_ns[key] = time_ns()
 
     @staticmethod
     def _get_service_key(service: Service) -> Tuple[Tuple[str, Optional[str]], int]:
@@ -389,7 +461,30 @@ class RoutedClient(Generic[T]):
 
             client = self._stub_cls(channel)  # type: ignore
             self._clients[key] = client
+            self._client_last_used_ns[key] = time_ns()
+            metrics.increment('pigeon.channel_opens', tags=[f'service:{self._service_name}'])
+            metrics.gauge('pigeon.open_channels', len(self._clients), tags=[f'service:{self._service_name}'])
             return client
+
+
+def _get_idle_timeout_ns() -> int:
+    timeout_seconds = os.getenv('OSPREY_PIGEON_CHANNEL_IDLE_TIMEOUT_SECONDS')
+    if not timeout_seconds:
+        return 0
+
+    try:
+        timeout = float(timeout_seconds)
+    except ValueError:
+        logger.warning(
+            'invalid OSPREY_PIGEON_CHANNEL_IDLE_TIMEOUT_SECONDS value %r, disabling idle channel eviction',
+            timeout_seconds,
+        )
+        return 0
+
+    if timeout <= 0:
+        return 0
+
+    return int(timeout * 1_000_000_000)
 
 
 def _make_message(
