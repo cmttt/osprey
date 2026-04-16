@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass
 from random import randint
 from typing import Optional
@@ -21,7 +20,6 @@ from osprey.worker.sinks.utils.acking_contexts_base import BaseAckingContext, Ve
 from osprey.async_worker.adaptor.interfaces import AsyncBaseOutputSink
 from osprey.async_worker.engine import AsyncOspreyEngine
 from osprey.async_worker.executor import execute as async_execute
-from osprey.async_worker.lib.coordinator_input_stream import AsyncVerdictsAckingContext
 from osprey.async_worker.sinks.sink.input_stream import AsyncBaseInputStream
 
 logger = logging.getLogger(__name__)
@@ -150,11 +148,6 @@ class AsyncRulesSink:
                             tag='sink:async-rules-sink',
                             parent_tracer_span=span,
                         )
-
-                        # Stamp classify_done on the context so _gen() can measure
-                        # the real classify -> ack-enqueue latency after yield returns.
-                        if isinstance(message_context, AsyncVerdictsAckingContext):
-                            message_context.classify_done_ts = time.monotonic()
 
                         if isinstance(message_context, VerdictsAckingContext):
                             if result is None:

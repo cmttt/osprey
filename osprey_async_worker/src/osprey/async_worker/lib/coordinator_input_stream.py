@@ -53,7 +53,6 @@ class AsyncVerdictsAckingContext(VerdictsAckingContext[OspreyEngineAction]):
         super().__init__(item)
         self._stream = stream
         self._ack_id = ack_id
-        self.classify_done_ts: Optional[float] = None
 
 
 class GrpcConnectionDiscoveryPool:
@@ -187,7 +186,7 @@ class OspreyCoordinatorBiDirectionalStream:
 
     def __init__(self, client_id: str, channel: grpc.aio.Channel, service: Service) -> None:
         self._client_id = client_id
-        self._outgoing_queue: asyncio.Queue[Optional[Tuple[Request, Optional[float]]]] = asyncio.Queue()
+        self._outgoing_queue: asyncio.Queue[Optional[Request]] = asyncio.Queue()
         self._stub = OspreyCoordinatorServiceStub(channel=channel)
         self._tags = [f'coordinator_connection_address:{service.connection_address}']
         self._connect_time: Optional[float] = None
@@ -199,20 +198,14 @@ class OspreyCoordinatorBiDirectionalStream:
     async def _outgoing_iterator(self) -> AsyncIterator[Request]:
         """Async generator that drains the outgoing queue for the gRPC call."""
         while True:
-            item = await self._outgoing_queue.get()
-            if item is None:
+            request = await self._outgoing_queue.get()
+            if request is None:
                 # Sentinel value — stop the outgoing side of the stream
                 return
-            request, enqueue_time = item
-            # Measure queue depth and drain latency
-            metrics.gauge('osprey_coordinator_input_stream.outgoing_queue_depth', self._outgoing_queue.qsize())
-            if enqueue_time is not None:
-                drain_latency_ms = (time.time() - enqueue_time) * 1000
-                metrics.histogram('osprey_coordinator_input_stream.ack_enqueue_to_iterator_drain_ms', drain_latency_ms)
             yield request
 
     async def _send(self, request: Request) -> None:
-        await self._outgoing_queue.put((request, None))
+        await self._outgoing_queue.put(request)
 
     async def _enqueue_stop_signal(self) -> None:
         await self._outgoing_queue.put(None)
@@ -227,7 +220,7 @@ class OspreyCoordinatorBiDirectionalStream:
         )
         metrics.increment('ack_or_nack.disconnect', tags=[f'ack:{ack}', f'verdicts:{verdicts is not None}'])
         logger.debug('submitting acking disconnect')
-        await self._outgoing_queue.put((Request(disconnect=Disconnect(ack_or_nack=ack_or_nack)), None))
+        await self._outgoing_queue.put(Request(disconnect=Disconnect(ack_or_nack=ack_or_nack)))
         await self._enqueue_stop_signal()
 
     def send_ack_or_nack(
@@ -243,7 +236,7 @@ class OspreyCoordinatorBiDirectionalStream:
         metrics.increment('ack_or_nack', tags=[f'ack:{ack}', f'verdicts:{verdicts is not None}'])
         logger.debug('submitting acking action request')
         self._last_action_request_time = time.time()
-        self._outgoing_queue.put_nowait((req, time.time()))
+        self._outgoing_queue.put_nowait(req)
 
     def get_uptime(self) -> float:
         assert self._connect_time is not None, 'This was called before a connection was established'
@@ -452,10 +445,6 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 ):
                     yield context
 
-                # --- ack-path metrics: measure the real boundary ---
-                yield_resume_ts = time.monotonic()
-                action_tags = [f'action_name:{osprey_engine_action.action_name}']
-
                 # Prioritize shutdown so we can ack the last action and disconnect gracefully
                 if self._shutdown_event.is_set():
                     await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
@@ -470,20 +459,6 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
 
                 # Normal path: ack the last action and request the next one
                 bidirectional_stream.send_ack_or_nack(ack_id, verdicts=context.get_verdicts())
-
-                # Emit ack-path latency metrics at the real enqueue boundary
-                ack_done_ts = time.monotonic()
-                metrics.histogram(
-                    'osprey_coordinator_input_stream.yield_resume_to_ack_enqueue_ms',
-                    (ack_done_ts - yield_resume_ts) * 1000,
-                    tags=action_tags,
-                )
-                if context.classify_done_ts is not None:
-                    metrics.histogram(
-                        'osprey_coordinator_input_stream.classify_to_ack_enqueue_ms',
-                        (ack_done_ts - context.classify_done_ts) * 1000,
-                        tags=action_tags,
-                    )
 
                 info_log_osprey_action(
                     osprey_coordinator_action.action_id, osprey_coordinator_action.action_name, 'acking'
