@@ -145,7 +145,7 @@ class EtcdWatcherdWatcher(BaseWatcher):
             self._set_state(EtcdWatcherState.RESET)
             delay = self._backoff.fail()
             log.warning(
-                '%r: etcd-watcherd stream raised an error (%s). sleeping for %.2f sec before retrying',
+                '%r: etcd-watcherd stream raised an error (%r). sleeping for %.2f sec before retrying',
                 self,
                 e,
                 delay,
@@ -166,7 +166,7 @@ class EtcdWatcherdWatcher(BaseWatcher):
 
         except Exception as e:
             delay = self._backoff.fail()
-            log.warning('%r: etcd raised an error (%s). sleeping for %.2f sec before retrying', self, e, delay)
+            log.warning('%r: etcd raised an error (%r). sleeping for %.2f sec before retrying', self, e, delay)
             time.sleep(delay)
 
     def _translate_event(self, event):
