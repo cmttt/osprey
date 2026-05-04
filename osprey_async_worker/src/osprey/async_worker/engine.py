@@ -6,6 +6,7 @@ Provides async execute() that calls the async executor directly.
 """
 
 import asyncio
+import gc
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -101,17 +102,47 @@ class AsyncOspreyEngine:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._thread_pool, self._compile_execution_graph_sync)
 
-    def _handle_updated_sources(self) -> None:
-        """Called by the sources provider when rules change in etcd."""
+    async def _handle_updated_sources(self) -> None:
+        """Called by the sources provider when rules change in etcd.
+
+        Runs the compile in self._thread_pool rather than on the event loop.
+        Two reasons this matters under memory pressure:
+
+        1. The event loop stays free during compile, so in-flight gRPC tasks
+           drain and release their pinned response buffers. Those buffers
+           can hold 200-400 MiB per process during a steady-state recompile;
+           letting them go before the new ExecutionGraph fully materializes
+           is the difference between fitting in the cgroup limit or not.
+
+        2. After the atomic swap, we force gc.collect() so the old graph
+           and compile intermediates are reclaimed immediately rather than
+           waiting for opportunistic collection. CPython's generational GC
+           does not reliably collect large transient compile-intermediate
+           objects on its own, which lets RSS drift up across recompiles.
+        """
         try:
-            self._execution_graph = self._compile_execution_graph_sync()
-            log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+            new_graph = await self.compile_execution_graph()
         except Exception:
             log.exception(
                 f'Failed to compile execution graph for sources={self._sources_provider.get_current_sources().hash()}'
             )
-        else:
-            self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
+            return
+
+        # Atomic swap. In-flight actions captured the old graph by reference at
+        # rules_sink.classify_one start and continue to use it until they finish;
+        # only newly-arriving actions read the new graph. Safe regardless of
+        # whether the input stream is paused.
+        self._execution_graph = new_graph
+
+        # Force collection of the old ExecutionGraph and compile-intermediate
+        # objects (validators, AST scratch state) the executor thread allocated.
+        # Two passes because the first pass may free objects with __del__ that
+        # become reachable for collection only on the next pass.
+        gc.collect()
+        gc.collect()
+
+        log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+        self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
 
         if self._validation_result_exporter is not None:
             try:

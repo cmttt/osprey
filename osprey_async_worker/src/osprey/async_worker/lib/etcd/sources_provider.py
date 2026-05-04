@@ -7,16 +7,20 @@ infrequent (rule deployments, not per-request).
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import random
-from typing import Callable, Dict, Optional
+from typing import Awaitable, Callable, Dict, Optional, Union
 
 from osprey.engine.ast.sources import Sources
 from osprey.worker.lib.etcd import EtcdClient, FullSyncOne, FullSyncOneNoKey
 from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 
-SourcesWatcherCallback = Callable[[], None]
+# The async engine's _handle_updated_sources is a coroutine function so the
+# compile can run in a thread pool while the event loop continues servicing
+# in-flight tasks. We accept either a sync or async callable for back-compat.
+SourcesWatcherCallback = Callable[[], Union[None, Awaitable[None]]]
 
 
 class AsyncInputStreamReadySignaler:
@@ -147,7 +151,9 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
 
         self._current_sources = new_sources
         if self._sources_watcher_callback:
-            self._sources_watcher_callback()
+            result = self._sources_watcher_callback()
+            if inspect.isawaitable(result):
+                await result
 
         if self._input_stream_ready_signaler is not None:
             logging.info('Restarting input streams')
