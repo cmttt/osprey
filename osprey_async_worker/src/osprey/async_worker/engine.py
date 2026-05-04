@@ -6,7 +6,6 @@ Provides async execute() that calls the async executor directly.
 """
 
 import asyncio
-import gc
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -133,20 +132,9 @@ class AsyncOspreyEngine:
     async def _handle_updated_sources(self) -> None:
         """Called by the sources provider when rules change in etcd.
 
-        Runs the compile in self._thread_pool rather than on the event loop.
-        Two reasons this matters under memory pressure:
-
-        1. The event loop stays free during compile, so in-flight gRPC tasks
-           drain and release their pinned response buffers. Those buffers
-           can hold 200-400 MiB per process during a steady-state recompile;
-           letting them go before the new ExecutionGraph fully materializes
-           is the difference between fitting in the cgroup limit or not.
-
-        2. After the atomic swap, we force gc.collect() so the old graph
-           and compile intermediates are reclaimed immediately rather than
-           waiting for opportunistic collection. CPython's generational GC
-           does not reliably collect large transient compile-intermediate
-           objects on its own, which lets RSS drift up across recompiles.
+        Runs the compile in self._thread_pool rather than on the event loop
+        so the loop stays free during compile and in-flight gRPC tasks can
+        drain and release their pinned response buffers.
         """
         try:
             new_graph = await self.compile_execution_graph()
@@ -159,15 +147,19 @@ class AsyncOspreyEngine:
         # Atomic swap. In-flight actions captured the old graph by reference at
         # rules_sink.classify_one start and continue to use it until they finish;
         # only newly-arriving actions read the new graph. Safe regardless of
-        # whether the input stream is paused.
+        # whether the input stream is paused. Reference counting reclaims the
+        # old graph + compile intermediates as their last reference drops.
+        #
+        # We deliberately do NOT call gc.collect() here. Forcing a full gen-2
+        # collection promotes every surviving object in the process into gen 2,
+        # which makes subsequent automatic collections during action processing
+        # measurably more expensive. With the previous gc.collect ×2 in place
+        # (added in cmttt/osprey#27) we observed sustained avg per-pod CPU
+        # 2.4× elevated for tens of minutes after each rule deploy. A pod
+        # rolling restart immediately recovered baseline CPU. The gevent
+        # engine does the swap without an explicit gc.collect and recovers
+        # cleanly; mirror that.
         self._execution_graph = new_graph
-
-        # Force collection of the old ExecutionGraph and compile-intermediate
-        # objects (validators, AST scratch state) the executor thread allocated.
-        # Two passes because the first pass may free objects with __del__ that
-        # become reachable for collection only on the next pass.
-        gc.collect()
-        gc.collect()
 
         log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
         self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
