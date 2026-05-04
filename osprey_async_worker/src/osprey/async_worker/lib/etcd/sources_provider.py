@@ -37,17 +37,14 @@ class AsyncInputStreamReadySignaler:
         return not self._event.is_set()
 
     async def pause_input_stream(self) -> None:
-        # Short jitter so the fleet doesn't synchronously disconnect on a rule
-        # deploy. Range is tuned to roughly span one worker's pause window
-        # (compile + reconnect — with periodic_execution_yield enabled on the
-        # engine's compile path, this is ~5-45s wall clock per worker), so at
-        # any moment ~half the fleet is paused and the other half continues
-        # serving traffic. Without jitter, all workers compile at once →
-        # coordinator queue grows for the full compile window → throughput
-        # cliff. The original 0-600s stretched fleet rollouts to ~10 minutes;
-        # this 0-30s range gives a ~30-75s rollout window that matches what
-        # gevent does in practice.
-        await asyncio.sleep(random.uniform(0, 30))
+        # Match the gevent worker's empirical jitter behavior. Gevent's
+        # pause_input_stream nominally calls gevent.sleep(random.uniform(0, 600))
+        # but production samples show its effective jitter is ~45s with sub-
+        # second variance across pods (likely an artifact of how gevent's
+        # scheduler handles the sleep from the etcd watcher greenlet). Mirror
+        # that behavior here so the asyncio worker fleet rolls out rule deploys
+        # on the same wall-clock cadence as gevent does in production.
+        await asyncio.sleep(random.uniform(40, 50))
         self._event.clear()
 
     def resume_input_stream(self) -> None:

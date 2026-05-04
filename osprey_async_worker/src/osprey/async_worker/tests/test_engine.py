@@ -63,20 +63,24 @@ async def test_handle_updated_sources_runs_compile_off_event_loop():
 
 
 @pytest.mark.asyncio
-async def test_handle_updated_sources_calls_gc_after_swap():
-    """After atomic swap, force gc.collect() so old graph + compile intermediates
-    are reclaimed immediately rather than waiting for opportunistic collection."""
+async def test_handle_updated_sources_does_not_force_gc():
+    """We deliberately do NOT call gc.collect() after swap.
+
+    Forcing gen-2 collection promotes every surviving object to gen 2, which
+    makes subsequent automatic collections during action processing more
+    expensive. We let CPython's reference counting reclaim the old graph
+    naturally — same as the gevent engine.
+    """
+    import gc as gc_module
     initial = MagicMock(name='initial_graph')
     new = MagicMock(name='new_graph')
     engine = _make_engine_with_stub_compile(initial, new)
 
     with patch.object(engine, '_compile_execution_graph_sync', return_value=new), \
-         patch('osprey.async_worker.engine.gc.collect') as mock_collect:
+         patch.object(gc_module, 'collect') as mock_collect:
         await engine._handle_updated_sources()
 
-    # Two passes: first pass may free objects with __del__ that become reachable
-    # for collection only on the next pass.
-    assert mock_collect.call_count == 2
+    assert mock_collect.call_count == 0
 
 
 @pytest.mark.asyncio
