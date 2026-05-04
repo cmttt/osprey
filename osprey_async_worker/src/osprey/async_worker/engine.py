@@ -39,6 +39,7 @@ from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.udf.registry import UDFRegistry
+from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.worker.lib.sources_config import get_config_registry
 from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 
@@ -61,33 +62,60 @@ class AsyncOspreyEngine:
         self,
         sources_provider: BaseSourcesProvider,
         udf_registry: UDFRegistry,
+        should_yield_during_compilation: bool = False,
         validation_exporter: Optional['BaseValidationResultExporter'] = None,
     ):
         self._sources_provider = sources_provider
         self._udf_registry = udf_registry
+        self._should_yield_during_compilation = should_yield_during_compilation
         config_registry = get_config_registry()
         self._validator_registry = ValidatorRegistry.instance_with_additional_validators(
             config_registry.get_validator()
         )
         self._thread_pool = ThreadPoolExecutor(max_workers=1)
-        self._execution_graph = self._compile_execution_graph_sync()
+        # Initial compile runs without periodic yields — there is no in-flight
+        # work yet to protect, and we want fast cold-start.
+        self._execution_graph = self._compile_execution_graph_sync(yield_during_compile=False)
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
 
-    def _compile_execution_graph_sync(self) -> ExecutionGraph:
-        """Compile the execution graph synchronously. Used for initial compilation."""
-        sources = self._sources_provider.get_current_sources()
+    def _compile_execution_graph_sync(self, yield_during_compile: bool = True) -> ExecutionGraph:
+        """Compile the execution graph synchronously.
 
-        start_time = time()
-        validated_sources = validate_sources(
-            sources, udf_registry=self._udf_registry, validator_registry=self._validator_registry
-        )
-        validation_time = time() - start_time
+        When ``yield_during_compile`` is True (the default for recompiles),
+        wraps the work in ``periodic_execution_yield`` which causes the
+        compile thread to ``time.sleep`` periodically, releasing the GIL so
+        the asyncio event loop can keep servicing in-flight tasks. This
+        mirrors what the gevent engine does via the same context manager.
 
-        start_time = time()
-        execution_graph = compile_execution_graph(validated_sources)
-        compile_time = time() - start_time
+        Without this, the compile thread holds the GIL contiguously for ~7s,
+        and the asyncio main thread (running the event loop) gets starved
+        of CPU even though it's only ~5ms of bytecode releases away from
+        running. With CFS throttling on the asyncio worker pods, that
+        starvation compounds — compile pegs CPU, CFS throttles, and every
+        in-flight coroutine stalls until compile finishes.
+
+        With yields: compile takes ~6× longer wall-clock (~42s) but uses
+        only ~16% of one core's CPU duty cycle, leaving plenty of headroom
+        for the rest of the worker.
+        """
+        with periodic_execution_yield(
+            on=yield_during_compile and self._should_yield_during_compilation,
+            execution_time_ms=5,
+            yield_time_ms=25,
+        ):
+            sources = self._sources_provider.get_current_sources()
+
+            start_time = time()
+            validated_sources = validate_sources(
+                sources, udf_registry=self._udf_registry, validator_registry=self._validator_registry
+            )
+            validation_time = time() - start_time
+
+            start_time = time()
+            execution_graph = compile_execution_graph(validated_sources)
+            compile_time = time() - start_time
 
         log.debug(
             'execution graph compiled: validation %.2fs, compilation %.2fs, total %.2fs',

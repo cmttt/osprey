@@ -1,7 +1,7 @@
 """Tests for the async etcd sources provider and input stream signaler."""
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,15 +23,17 @@ async def test_signaler_starts_ready():
 @pytest.mark.asyncio
 async def test_signaler_pause_clears_event():
     signaler = AsyncInputStreamReadySignaler()
-    # Override the jitter sleep so test is fast
-    await signaler.pause_input_stream()
+    # Mock the jitter sleep so the test is fast
+    with patch('osprey.async_worker.lib.etcd.sources_provider.asyncio.sleep', return_value=None):
+        await signaler.pause_input_stream()
     assert signaler.should_pause_input_stream()
 
 
 @pytest.mark.asyncio
 async def test_signaler_resume_sets_event():
     signaler = AsyncInputStreamReadySignaler()
-    await signaler.pause_input_stream()
+    with patch('osprey.async_worker.lib.etcd.sources_provider.asyncio.sleep', return_value=None):
+        await signaler.pause_input_stream()
     signaler.resume_input_stream()
     assert not signaler.should_pause_input_stream()
 
@@ -39,7 +41,8 @@ async def test_signaler_resume_sets_event():
 @pytest.mark.asyncio
 async def test_signaler_wait_blocks_when_paused():
     signaler = AsyncInputStreamReadySignaler()
-    await signaler.pause_input_stream()
+    with patch('osprey.async_worker.lib.etcd.sources_provider.asyncio.sleep', return_value=None):
+        await signaler.pause_input_stream()
 
     # wait_until_resume should block until resume is called
     resumed = False
@@ -122,7 +125,8 @@ async def test_handle_event_awaits_async_callback():
 
     provider.set_sources_watcher(async_callback)
 
-    await provider._handle_event(_make_full_sync_event({'main.sml': '# noop'}))
+    with patch('osprey.async_worker.lib.etcd.sources_provider.asyncio.sleep', return_value=None):
+        await provider._handle_event(_make_full_sync_event({'main.sml': '# noop'}))
 
     assert awaited.is_set(), 'async callback was not awaited'
 
@@ -134,7 +138,8 @@ async def test_handle_event_calls_sync_callback():
     callback = MagicMock()
     provider.set_sources_watcher(callback)
 
-    await provider._handle_event(_make_full_sync_event({'main.sml': '# noop'}))
+    with patch('osprey.async_worker.lib.etcd.sources_provider.asyncio.sleep', return_value=None):
+        await provider._handle_event(_make_full_sync_event({'main.sml': '# noop'}))
 
     callback.assert_called_once()
 
