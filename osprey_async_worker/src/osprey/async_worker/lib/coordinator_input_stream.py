@@ -8,6 +8,8 @@ import grpc
 import grpc.aio
 import pytz
 import sentry_sdk
+from osprey.async_worker.lib.etcd.sources_provider import AsyncInputStreamReadySignaler
+from osprey.async_worker.sinks.sink.input_stream import AsyncBaseInputStream
 from osprey.engine.executor.execution_context import Action as OspreyEngineAction
 from osprey.engine.executor.execution_context import ExecutionResult
 from osprey.rpc.common.v1.verdicts_pb2 import Verdicts
@@ -27,9 +29,7 @@ from osprey.rpc.osprey_coordinator.bidirectional_stream.v1.service_pb2_grpc impo
 from osprey.worker.lib.discovery.service import Service
 from osprey.worker.lib.instruments import metrics
 from osprey.worker.lib.osprey_shared.logging import get_logger, info_log_osprey_action
-from osprey.worker.sinks.utils.acking_contexts_base import BaseAckingContext, NoopAckingContext, VerdictsAckingContext
-
-from osprey.async_worker.sinks.sink.input_stream import AsyncBaseInputStream
+from osprey.worker.sinks.utils.acking_contexts_base import BaseAckingContext, VerdictsAckingContext
 
 logger = get_logger()
 
@@ -127,7 +127,8 @@ class GrpcConnectionDiscoveryPool:
                     self._grpc_channels[service] = (self._create_async_channel(service), service)
             logger.info(
                 'async discovery initialized for %s: %d instances',
-                self._service_name, len(self._grpc_channels),
+                self._service_name,
+                len(self._grpc_channels),
             )
         except Exception:
             self._needs_async_init = True
@@ -223,9 +224,7 @@ class OspreyCoordinatorBiDirectionalStream:
         await self._outgoing_queue.put(Request(disconnect=Disconnect(ack_or_nack=ack_or_nack)))
         await self._enqueue_stop_signal()
 
-    def send_ack_or_nack(
-        self, ack_id: int, ack: bool = True, verdicts: Optional[Verdicts] = None
-    ) -> None:
+    def send_ack_or_nack(self, ack_id: int, ack: bool = True, verdicts: Optional[Verdicts] = None) -> None:
         """Fire-and-forget ack — uses put_nowait to match gevent's non-blocking Queue.put()."""
         ack_or_nack = (
             AckOrNack(ack_id=ack_id, ack=Ack(verdicts=verdicts if verdicts else None))
@@ -251,7 +250,8 @@ class OspreyCoordinatorBiDirectionalStream:
     async def _gen(self) -> AsyncIterator[OspreyCoordinatorAction]:
         logger.info(
             'bidi stream connecting to coordinator %s (client_id=%s)',
-            self._tags, self._client_id,
+            self._tags,
+            self._client_id,
         )
         await self._send(Request(action_request=ActionRequest(initial=ClientDetails(id=self._client_id))))
         self._last_action_request_time = time.time()
@@ -293,14 +293,22 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         self,
         client_id: str,
         coordinator_service_name: str = 'osprey_coordinator',
+        input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
     ) -> None:
         self._client_id = client_id
         self._channel_pool = GrpcConnectionDiscoveryPool(coordinator_service_name)
         self._shutdown_event = asyncio.Event()
         self._current_execution_result: Optional[ExecutionResult] = None
+        self._input_stream_ready_signaler = input_stream_ready_signaler
 
     @classmethod
-    def from_direct_address(cls, client_id: str, address: str, service_name: str = 'osprey_coordinator') -> 'OspreyCoordinatorInputStream':
+    def from_direct_address(
+        cls,
+        client_id: str,
+        address: str,
+        service_name: str = 'osprey_coordinator',
+        input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+    ) -> 'OspreyCoordinatorInputStream':
         """Create an input stream connected directly to a coordinator address.
 
         Bypasses etcd service discovery. Each instance gets its own gRPC channel.
@@ -310,10 +318,16 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         instance._shutdown_event = asyncio.Event()
         instance._current_execution_result = None
         instance._channel_pool = GrpcConnectionDiscoveryPool.from_static(address, service_name)
+        instance._input_stream_ready_signaler = input_stream_ready_signaler
         return instance
 
     @classmethod
-    def from_async_discovery(cls, client_id: str, service_name: str = 'osprey_coordinator') -> 'OspreyCoordinatorInputStream':
+    def from_async_discovery(
+        cls,
+        client_id: str,
+        service_name: str = 'osprey_coordinator',
+        input_stream_ready_signaler: Optional[AsyncInputStreamReadySignaler] = None,
+    ) -> 'OspreyCoordinatorInputStream':
         """Create an input stream using async etcd discovery (no gevent).
 
         Discovers all coordinator instances from etcd. Each ``get_connection()`` call
@@ -324,6 +338,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
         instance._shutdown_event = asyncio.Event()
         instance._current_execution_result = None
         instance._channel_pool = GrpcConnectionDiscoveryPool.from_async_discovery(service_name)
+        instance._input_stream_ready_signaler = input_stream_ready_signaler
         return instance
 
     async def stop(self) -> None:
@@ -448,6 +463,19 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 # Prioritize shutdown so we can ack the last action and disconnect gracefully
                 if self._shutdown_event.is_set():
                     await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
+                    break
+
+                # Pause-and-rotate on rule reload. Mirrors the gevent equivalent at
+                # osprey/worker/sinks/sink/osprey_coordinator_input_stream.py:325-331:
+                # disconnect the bidi stream so the coordinator routes work elsewhere,
+                # wait for the reload to finish, then let the outer loop reconnect.
+                if (
+                    self._input_stream_ready_signaler is not None
+                    and self._input_stream_ready_signaler.should_pause_input_stream()
+                ):
+                    logger.info('Disconnecting due to input stream ready signaler')
+                    await bidirectional_stream.send_graceful_disconnect(ack_id, verdicts=context.get_verdicts())
+                    await self._input_stream_ready_signaler.wait_until_resume()
                     break
 
                 # Reconnect after the jittered uptime threshold
