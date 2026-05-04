@@ -10,7 +10,6 @@ import asyncio
 import inspect
 import json
 import logging
-import random
 from typing import Awaitable, Callable, Dict, Optional, Union
 
 from osprey.engine.ast.sources import Sources
@@ -37,7 +36,17 @@ class AsyncInputStreamReadySignaler:
         return not self._event.is_set()
 
     async def pause_input_stream(self) -> None:
-        await asyncio.sleep(random.uniform(0, 600))  # Same jitter as gevent version
+        # The original 0-600s jitter was intended to stagger pauses across the
+        # fleet so workers don't all disconnect from the coordinator at once.
+        # In practice the asyncio worker's individual pause+compile+reconnect
+        # cycle is only ~30s, and the production gevent worker's effective
+        # jitter is ~40s (verified empirically — its `gevent.sleep` in this
+        # code path doesn't behave as the 0-600s range suggests). Honoring the
+        # full 0-600s on asyncio stretches fleet-wide rule rollouts to ~10
+        # minutes vs gevent's ~50s, with the asyncio fleet's `rules_hash` bar
+        # decaying linearly across the jitter window. Removing the sleep makes
+        # asyncio match gevent's effective behavior — fast fleet rollout, each
+        # worker offline only for the actual compile+reconnect duration.
         self._event.clear()
 
     def resume_input_stream(self) -> None:
