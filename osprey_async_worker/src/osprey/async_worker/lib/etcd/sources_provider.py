@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import logging
+import random
 from typing import Awaitable, Callable, Dict, Optional, Union
 
 from osprey.engine.ast.sources import Sources
@@ -36,17 +37,17 @@ class AsyncInputStreamReadySignaler:
         return not self._event.is_set()
 
     async def pause_input_stream(self) -> None:
-        # The original 0-600s jitter was intended to stagger pauses across the
-        # fleet so workers don't all disconnect from the coordinator at once.
-        # In practice the asyncio worker's individual pause+compile+reconnect
-        # cycle is only ~30s, and the production gevent worker's effective
-        # jitter is ~40s (verified empirically — its `gevent.sleep` in this
-        # code path doesn't behave as the 0-600s range suggests). Honoring the
-        # full 0-600s on asyncio stretches fleet-wide rule rollouts to ~10
-        # minutes vs gevent's ~50s, with the asyncio fleet's `rules_hash` bar
-        # decaying linearly across the jitter window. Removing the sleep makes
-        # asyncio match gevent's effective behavior — fast fleet rollout, each
-        # worker offline only for the actual compile+reconnect duration.
+        # Short jitter so the fleet doesn't synchronously disconnect on a rule
+        # deploy. Range is tuned to roughly span one worker's pause window
+        # (compile + reconnect — with periodic_execution_yield enabled on the
+        # engine's compile path, this is ~5-45s wall clock per worker), so at
+        # any moment ~half the fleet is paused and the other half continues
+        # serving traffic. Without jitter, all workers compile at once →
+        # coordinator queue grows for the full compile window → throughput
+        # cliff. The original 0-600s stretched fleet rollouts to ~10 minutes;
+        # this 0-30s range gives a ~30-75s rollout window that matches what
+        # gevent does in practice.
+        await asyncio.sleep(random.uniform(0, 30))
         self._event.clear()
 
     def resume_input_stream(self) -> None:
