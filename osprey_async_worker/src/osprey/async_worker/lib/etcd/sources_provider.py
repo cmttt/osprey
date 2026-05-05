@@ -37,14 +37,12 @@ class AsyncInputStreamReadySignaler:
         return not self._event.is_set()
 
     async def pause_input_stream(self) -> None:
-        # Match the gevent worker's empirical jitter behavior. Gevent's
-        # pause_input_stream nominally calls gevent.sleep(random.uniform(0, 600))
-        # but production samples show its effective jitter is ~45s with sub-
-        # second variance across pods (likely an artifact of how gevent's
-        # scheduler handles the sleep from the etcd watcher greenlet). Mirror
-        # that behavior here so the asyncio worker fleet rolls out rule deploys
-        # on the same wall-clock cadence as gevent does in production.
-        await asyncio.sleep(random.uniform(40, 50))
+        # Match the gevent worker's nominal jitter range. The compile pauses
+        # input on the worker for ~28s; spreading the pause start uniformly
+        # across the fleet over 10 minutes keeps the fraction of paused pods
+        # to ~5% at any moment, avoiding the throughput cliff that happens
+        # when the whole fleet pauses together.
+        await asyncio.sleep(random.uniform(0, 600))
         self._event.clear()
 
     def resume_input_stream(self) -> None:
