@@ -74,6 +74,12 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         self._sources_watcher_callback: Optional[SourcesWatcherCallback] = None
         self._input_stream_ready_signaler = input_stream_ready_signaler
         self._watcher = None
+        # Long-lived iterator over the watcher's event stream. continue_watching()
+        # is a generator function — every call creates a new generator with a
+        # fresh WatchMux and a reset _index, which defeats the watcher's built-in
+        # dedup of redundant FullSyncOne events. Iterate one generator persistently
+        # to match how ReadOnlyEtcdDict drives the gevent watcher.
+        self._watcher_iter = None
         self._watcher_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
@@ -109,21 +115,33 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
         try:
             while True:
                 if self._watcher is None:
-                    self._watcher = await loop.run_in_executor(
-                        None, self._client.get_watcher, self._etcd_key, False
-                    )
+                    self._watcher = await loop.run_in_executor(None, self._client.get_watcher, self._etcd_key, False)
+                    self._watcher_iter = None
+                if self._watcher_iter is None:
+                    assert self._watcher is not None
+                    self._watcher_iter = self._watcher.continue_watching()
 
-                # Block in thread pool waiting for next etcd event
+                # Block in thread pool waiting for next etcd event. Drive the
+                # SAME generator each iteration — the watcher's WatchMux dedups
+                # consecutive identical FullSyncOne events (which are common
+                # post-rule-deploy as etcd's wait API re-syncs), but the dedup
+                # state lives on the generator. Recreating the generator per
+                # event would defeat the dedup and put the loop into a tight
+                # SYNC re-fetch loop on the main asyncio thread.
+                watcher_iter = self._watcher_iter
                 try:
-                    event = await loop.run_in_executor(None, self._get_next_event)
+                    event = await loop.run_in_executor(None, lambda: next(watcher_iter))
                     backoff = 1.0  # Reset on success
                 except StopIteration:
-                    # Watcher exhausted, restart
+                    # Generator exhausted (e.g. transient etcd error inside
+                    # continue_watching). Reopen the watcher fresh.
                     self._watcher = None
+                    self._watcher_iter = None
                     continue
                 except Exception:
                     logging.exception('Error in etcd watcher loop, retrying in %.1fs', backoff)
                     self._watcher = None
+                    self._watcher_iter = None
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
                     continue
@@ -134,10 +152,7 @@ class AsyncEtcdSourcesProvider(BaseSourcesProvider):
             return
         finally:
             self._watcher = None
-
-    def _get_next_event(self):
-        """Get the next event from the watcher iterator. Runs in thread pool."""
-        return next(iter(self._watcher.continue_watching()))
+            self._watcher_iter = None
 
     async def _handle_event(self, event) -> None:
         """Handle an etcd event by updating sources and notifying watchers."""
