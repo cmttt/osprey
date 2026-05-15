@@ -25,6 +25,7 @@ mod tonic_mock;
 use anyhow::Result;
 use clap::Parser;
 use proto::osprey_coordinator_sync_action::osprey_coordinator_sync_action_service_server::OspreyCoordinatorSyncActionServiceServer;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,11 +95,14 @@ async fn main() -> Result<()> {
             metrics.clone(),
         ));
 
+    let is_shutting_down = Arc::new(AtomicBool::new(false));
+
     let osprey_coordinator_sync_action_service =
         OspreyCoordinatorSyncActionServiceServer::new(sync_action_rpc::SyncActionServer::new(
             snowflake_client.clone(),
             priority_queue_sender.clone(),
             metrics.clone(),
+            is_shutting_down.clone(),
         ));
 
     let consumer_type = std::env::var("OSPREY_COORDINATOR_CONSUMER_TYPE").ok();
@@ -169,6 +173,7 @@ async fn main() -> Result<()> {
     shutdown_handler::spawn_shutdown_handler(
         priority_queue_sender.clone(),
         priority_queue_receiver.clone(),
+        is_shutting_down.clone(),
     );
 
     tracing::info!("starting consumer/bidi stream/sync classification rpc");
