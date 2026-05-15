@@ -35,6 +35,8 @@ define_metrics!(OspreyCoordinatorMetrics, [
     sync_classification_failure_oneshot_dropped => StaticCounter("sync_classification_failure", ["error" => "oneshot_dropped"]),
     // How many sync actions have failed because we couldn't send to the priority queue
     sync_classification_failure_pq_send => StaticCounter("sync_classification_failure", ["error" => "pq_send"]),
+    // How many sync actions were fast-rejected because this pod is shutting down
+    sync_classification_failure_shutting_down => StaticCounter("sync_classification_failure", ["error" => "shutting_down"]),
     sync_classification_failure_label_service => StaticCounter("sync_classification_failure", ["error" => "label_service"]),
 
     // How many acks for sync actions
