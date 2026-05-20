@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Type, Union
 
 from osprey.engine.ast import grammar
 from osprey.engine.query_language.udfs.registry import register
@@ -10,7 +10,10 @@ from osprey.engine.udf.base import QueryUdfBase
 class Arguments(ArgumentsBase):
     predicate: bool
     window: ConstExpr[str]
-    key: Optional[str] = None
+    # `key` accepts column refs to Entity-typed columns. We use Union[int, str] so the type
+    # evaluator's unwrap mechanism (EntityT[X] → X via PostExecutionConvertible) accepts
+    # the common entity ID types — Entity[int] (snowflakes) and Entity[str].
+    key: Optional[Union[int, str]] = None
 
 
 @dataclass(frozen=True)
