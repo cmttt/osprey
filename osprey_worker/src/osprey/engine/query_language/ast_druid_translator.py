@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from osprey.engine.ast import grammar
@@ -6,7 +7,6 @@ from osprey.engine.ast_validator.validators.validate_call_kwargs import Validate
 from osprey.engine.udf.base import QueryUdfBase
 from osprey.engine.utils.osprey_unary_executor import OspreyUnaryExecutor
 from osprey.engine.query_language.udfs.count_over import operator_metadata_for, CountOver
-from osprey.engine.stdlib.udfs.time_delta import TimeDelta
 
 
 class DruidQueryTransformException(Exception):
@@ -144,38 +144,35 @@ class DruidQueryTransformer:
         return None
 
     def _extract_window_seconds(self, node: grammar.ASTNode) -> Optional[int]:
-        """Extract window duration in seconds from a TimeDelta(...) call."""
-        if not isinstance(node, grammar.Call):
-            return None
-        if not (isinstance(node.func, grammar.Name) and node.func.identifier == 'TimeDelta'):
+        """Extract window duration in seconds from a time-delta string literal.
+
+        Supports formats like '10m', '1h', '30s', '7d' with units: s, m, h, d.
+        Returns total seconds, or None if the format is invalid.
+        """
+        if not isinstance(node, grammar.String):
             return None
 
-        # Sum up the keyword arguments: weeks, days, hours, minutes, seconds
-        total_seconds = 0
-        for keyword in node.arguments:
-            if keyword.name == 'weeks':
-                val = self._extract_literal_int(keyword.value)
-                if val is not None:
-                    total_seconds += val * 7 * 24 * 3600
-            elif keyword.name == 'days':
-                val = self._extract_literal_int(keyword.value)
-                if val is not None:
-                    total_seconds += val * 24 * 3600
-            elif keyword.name == 'hours':
-                val = self._extract_literal_int(keyword.value)
-                if val is not None:
-                    total_seconds += val * 3600
-            elif keyword.name == 'minutes':
-                val = self._extract_literal_int(keyword.value)
-                if val is not None:
-                    total_seconds += val * 60
-            elif keyword.name == 'seconds':
-                val = self._extract_literal_int(keyword.value)
-                if val is not None:
-                    total_seconds += val
+        window_str = node.value
+        # Match pattern: digits followed by one of (s, m, h, d)
+        match = re.match(r'^(\d+)([smhd])$', window_str)
+        if not match:
+            return None
 
-        # Return the total even if it's 0; validation of window > 0 is Phase 1's job
-        return total_seconds
+        amount_str, unit = match.groups()
+        try:
+            amount = int(amount_str)
+        except ValueError:
+            return None
+
+        # Convert to seconds based on unit
+        multipliers = {
+            's': 1,
+            'm': 60,
+            'h': 3600,
+            'd': 86400,
+        }
+
+        return amount * multipliers[unit]
 
     def _extract_key(self, call: grammar.Call) -> Optional[str]:
         """Extract the key argument (partition column name) from a CountOver call."""

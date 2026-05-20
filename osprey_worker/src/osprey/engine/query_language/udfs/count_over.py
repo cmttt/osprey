@@ -2,15 +2,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Type
 
 from osprey.engine.ast import grammar
-from osprey.engine.language_types.time_delta import TimeDeltaT
 from osprey.engine.query_language.udfs.registry import register
-from osprey.engine.udf.arguments import ArgumentsBase
+from osprey.engine.udf.arguments import ArgumentsBase, ConstExpr
 from osprey.engine.udf.base import QueryUdfBase
 
 
 class Arguments(ArgumentsBase):
     predicate: bool
-    window: TimeDeltaT
+    window: ConstExpr[str]
     key: Optional[str] = None
 
 
@@ -101,8 +100,8 @@ class CountOver(QueryUdfBase[Arguments, int]):
 
     # Examples
 
-    `CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId)`
-    `CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=1))`
+    `CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId)`
+    `CountOver(predicate=Endpoint == '/foo', window='1m')`
     """
 
     def to_druid_query(self) -> Dict[str, object]:

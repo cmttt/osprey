@@ -15,8 +15,6 @@ from osprey.engine.query_language import parse_query_to_validated_ast
 from osprey.engine.query_language.ast_druid_translator import DruidQueryTransformer
 from osprey.engine.query_language.tests.conftest import MakeRulesSourcesFunction
 from osprey.engine.query_language.udfs.count_over import CountOver
-from osprey.engine.query_language.udfs.registry import UDF_REGISTRY
-from osprey.engine.stdlib.udfs.time_delta import TimeDelta
 from osprey.engine.udf.registry import UDFRegistry
 
 # Validators and UDF registry setup for CountOver translator tests
@@ -32,16 +30,8 @@ pytestmark: List[Callable[[Any], Any]] = [
             VariablesMustBeDefined,
         ]
     ),
-    pytest.mark.use_udf_registry(UDFRegistry.with_udfs(CountOver, TimeDelta)),
+    pytest.mark.use_udf_registry(UDFRegistry.with_udfs(CountOver)),
 ]
-
-# Register TimeDelta in the global query-language UDF registry for parse_query_to_validated_ast
-# (normally TimeDelta is in stdlib, but parse_query_to_validated_ast needs it in the query-language registry)
-try:
-    UDF_REGISTRY.register(TimeDelta)
-except Exception:
-    # Already registered, ignore
-    pass
 
 
 # Snapshot tests for all 13 cases (6 ops × 2 keying variants + AND filter case)
@@ -50,9 +40,9 @@ except Exception:
 def test_count_over_gte_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) >= 10 (with key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) >= 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) >= 10",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) >= 10",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -63,9 +53,9 @@ def test_count_over_gte_with_key(
 def test_count_over_gt_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) > 10 (with key)"""
+    """CountOver(predicate=Endpoint == '/foo', window='10m', key=UserId) > 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) > 10",
+        "CountOver(predicate=Endpoint == '/foo', window='10m', key=UserId) > 10",
         make_rules_sources([('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -76,9 +66,9 @@ def test_count_over_gt_with_key(
 def test_count_over_eq_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=UserLoginIp == '1.1.1.1' and Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) == 10 (with key, AND predicate)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1' and Endpoint == '/foo', window='10m', key=UserId) == 10 (with key, AND predicate)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1' and Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) == 10",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1' and Endpoint == '/foo', window='10m', key=UserId) == 10",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -89,9 +79,9 @@ def test_count_over_eq_with_key(
 def test_count_over_neq_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) != 5 (with key)"""
+    """CountOver(predicate=Endpoint == '/foo', window='10m', key=UserId) != 5 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) != 5",
+        "CountOver(predicate=Endpoint == '/foo', window='10m', key=UserId) != 5",
         make_rules_sources([('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -102,9 +92,9 @@ def test_count_over_neq_with_key(
 def test_count_over_lte_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) <= 10 (with key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) <= 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) <= 10",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) <= 10",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -115,9 +105,9 @@ def test_count_over_lte_with_key(
 def test_count_over_lt_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) < 10 (with key)"""
+    """CountOver(predicate=Endpoint == '/foo', window='10m', key=UserId) < 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) < 10",
+        "CountOver(predicate=Endpoint == '/foo', window='10m', key=UserId) < 10",
         make_rules_sources([('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -128,9 +118,9 @@ def test_count_over_lt_with_key(
 def test_count_over_gte_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) >= 10 (no key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m') >= 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) >= 10",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m') >= 10",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -141,9 +131,9 @@ def test_count_over_gte_no_key(
 def test_count_over_gt_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) > 10 (no key)"""
+    """CountOver(predicate=Endpoint == '/foo', window='10m') > 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) > 10",
+        "CountOver(predicate=Endpoint == '/foo', window='10m') > 10",
         make_rules_sources([('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -154,9 +144,9 @@ def test_count_over_gt_no_key(
 def test_count_over_eq_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=UserLoginIp == '1.1.1.1' or Endpoint == '/foo', window=TimeDelta(minutes=10)) == 10 (no key, OR predicate)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1' or Endpoint == '/foo', window='10m') == 10 (no key, OR predicate)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1' or Endpoint == '/foo', window=TimeDelta(minutes=10)) == 10",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1' or Endpoint == '/foo', window='10m') == 10",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -167,9 +157,9 @@ def test_count_over_eq_no_key(
 def test_count_over_neq_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) != 5 (no key)"""
+    """CountOver(predicate=Endpoint == '/foo', window='10m') != 5 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) != 5",
+        "CountOver(predicate=Endpoint == '/foo', window='10m') != 5",
         make_rules_sources([('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -180,9 +170,9 @@ def test_count_over_neq_no_key(
 def test_count_over_lte_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) <= 10 (no key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m') <= 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) <= 10",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m') <= 10",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -193,9 +183,9 @@ def test_count_over_lte_no_key(
 def test_count_over_lt_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) < 10 (no key)"""
+    """CountOver(predicate=Endpoint == '/foo', window='10m') < 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) < 10",
+        "CountOver(predicate=Endpoint == '/foo', window='10m') < 10",
         make_rules_sources([('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
@@ -208,7 +198,7 @@ def test_count_over_with_and_filter(
 ) -> None:
     """CountOver(...) >= 10 and Country != 'US' - verifies AND-conjunct folding"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) >= 10 and Country != 'US'",
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) >= 10 and Country != 'US'",
         make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'"), ('Country', "'someCountry'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()

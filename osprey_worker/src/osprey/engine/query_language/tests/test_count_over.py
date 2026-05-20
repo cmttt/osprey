@@ -14,26 +14,25 @@ from osprey.engine.query_language.udfs.count_over import (
     OperatorMetadata,
     operator_metadata_for,
 )
-from osprey.engine.stdlib.udfs.time_delta import TimeDelta
 from osprey.engine.udf.registry import UDFRegistry
 
 pytestmark: List[Callable[[Any], Any]] = [
     pytest.mark.use_validators([ValidateCallKwargs, ValidateDynamicCallsHaveAnnotatedRValue, UniqueStoredNames]),
-    pytest.mark.use_udf_registry(UDFRegistry.with_udfs(CountOver, TimeDelta)),
+    pytest.mark.use_udf_registry(UDFRegistry.with_udfs(CountOver)),
 ]
 
 
 def test_count_over_with_key(run_validation: RunValidationFunction) -> None:
-    run_validation("CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId)")
+    run_validation("CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId)")
 
 
 def test_count_over_without_key(run_validation: RunValidationFunction) -> None:
-    run_validation("CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=1))")
+    run_validation("CountOver(predicate=Endpoint == '/foo', window='1m')")
 
 
 def test_count_over_to_druid_query_raises_not_implemented(run_validation: RunValidationFunction) -> None:
     validated_sources = run_validation(
-        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId)"
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId)"
     )
 
     udf_mapping = validated_sources.get_validator_result(ValidateCallKwargs)
