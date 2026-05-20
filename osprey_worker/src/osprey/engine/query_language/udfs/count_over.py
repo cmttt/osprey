@@ -1,7 +1,5 @@
 from typing import Dict, Optional
 
-from osprey.engine.ast import grammar
-from osprey.engine.ast_validator.validation_context import ValidationContext
 from osprey.engine.language_types.time_delta import TimeDeltaT
 from osprey.engine.query_language.udfs.registry import register
 from osprey.engine.udf.arguments import ArgumentsBase
@@ -25,24 +23,8 @@ class CountOver(QueryUdfBase[Arguments, int]):
     `CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=1))`
     """
 
-    def __init__(self, validation_context: ValidationContext, arguments: Arguments):
-        super().__init__(validation_context, arguments)
-
-        if arguments.key is not None:
-            key_node = arguments.get_argument_ast('key')
-            if isinstance(key_node, grammar.Name):
-                self.key = key_node.identifier
-            else:
-                self.key = None
-                validation_context.add_error(
-                    message='expected column reference',
-                    span=key_node.span,
-                    hint='argument `key` must be a column reference',
-                )
-        else:
-            self.key = None
-
     def to_druid_query(self) -> Dict[str, object]:
+        # Phase 2 wires Druid lowering through osprey ast_druid_translator.py; until then this guard prevents silent use.
         raise NotImplementedError(
             "CountOver Druid lowering ships in Phase 2; do not call directly."
         )
