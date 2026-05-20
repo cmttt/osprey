@@ -1,4 +1,5 @@
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Type
 
 from osprey.engine.language_types.time_delta import TimeDeltaT
 from osprey.engine.query_language.udfs.registry import register
@@ -10,6 +11,88 @@ class Arguments(ArgumentsBase):
     predicate: bool
     window: TimeDeltaT
     key: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class OperatorMetadata:
+    """Structural metadata for per-operator LAG-based subquery emission.
+
+    Attributes:
+        lag_offsets: Ordered list of LAG offset values (typically 1 or 2 elements).
+                     Element 0 maps to pt1, element 1 (if present) maps to pt2.
+        post_filter_template: SQL fragment using placeholders like {window_seconds}.
+                             Example: "pt1 IS NOT NULL AND __time - pt1 <= {window_seconds}"
+    """
+    lag_offsets: List[int]
+    post_filter_template: str
+
+
+def operator_metadata_for(comparator_type: Type[object], threshold: int) -> OperatorMetadata:
+    """Returns the per-operator metadata (LAG offsets and post-filter SQL) for CountOver lowering.
+
+    Implements RFC Appendix A table mapping each comparison operator to its LAG configuration.
+
+    Args:
+        comparator_type: The outer operator class (e.g., grammar.GreaterThanEquals).
+        threshold: The integer threshold literal (N in e.g., CountOver(...) >= N).
+
+    Returns:
+        OperatorMetadata with lag_offsets and post_filter_template populated.
+
+    Raises:
+        ValueError: If the comparator_type is not one of the six supported operators.
+    """
+    # Import here to avoid circular imports
+    from osprey.engine.ast import grammar
+
+    if comparator_type == grammar.GreaterThanEquals:
+        # >= N: LAG(__time, N-1) AS pt1 + check pt1 exists within window
+        return OperatorMetadata(
+            lag_offsets=[threshold - 1],
+            post_filter_template="pt1 IS NOT NULL AND __time - pt1 <= {window_seconds}",
+        )
+    elif comparator_type == grammar.GreaterThan:
+        # > N: LAG(__time, N) AS pt1 + check pt1 exists within window
+        return OperatorMetadata(
+            lag_offsets=[threshold],
+            post_filter_template="pt1 IS NOT NULL AND __time - pt1 <= {window_seconds}",
+        )
+    elif comparator_type == grammar.Equals:
+        # == N: LAG(__time, N-1) AS pt1, LAG(__time, N) AS pt2
+        # Filter: pt1 exists and within window AND (pt2 absent OR pt2 outside window)
+        return OperatorMetadata(
+            lag_offsets=[threshold - 1, threshold],
+            post_filter_template=(
+                "pt1 IS NOT NULL AND __time - pt1 <= {window_seconds} AND "
+                "(pt2 IS NULL OR __time - pt2 > {window_seconds})"
+            ),
+        )
+    elif comparator_type == grammar.NotEquals:
+        # != N: Inverse of == N
+        return OperatorMetadata(
+            lag_offsets=[threshold - 1, threshold],
+            post_filter_template=(
+                "NOT (pt1 IS NOT NULL AND __time - pt1 <= {window_seconds} AND "
+                "(pt2 IS NULL OR __time - pt2 > {window_seconds}))"
+            ),
+        )
+    elif comparator_type == grammar.LessThanEquals:
+        # <= N: LAG(__time, N) AS pt1 + check pt1 absent or outside window
+        return OperatorMetadata(
+            lag_offsets=[threshold],
+            post_filter_template="pt1 IS NULL OR __time - pt1 > {window_seconds}",
+        )
+    elif comparator_type == grammar.LessThan:
+        # < N: equivalent to <= N-1, so LAG(__time, N-1) AS pt1
+        return OperatorMetadata(
+            lag_offsets=[threshold - 1],
+            post_filter_template="pt1 IS NULL OR __time - pt1 > {window_seconds}",
+        )
+    else:
+        raise ValueError(
+            f"Unsupported comparator type: {comparator_type}. "
+            "Expected one of: GreaterThanEquals, GreaterThan, Equals, NotEquals, LessThanEquals, LessThan"
+        )
 
 
 @register
@@ -24,7 +107,10 @@ class CountOver(QueryUdfBase[Arguments, int]):
     """
 
     def to_druid_query(self) -> Dict[str, object]:
-        # Phase 2 wires Druid lowering through osprey ast_druid_translator.py; until then this guard prevents silent use.
+        # Phase 2 Task 2 (DruidQueryTransformer) handles the actual Druid SQL emission.
+        # The UDF itself only provides structural metadata via operator_metadata_for().
+        # This method remains abstract-like for interface compliance; real work happens in the translator.
         raise NotImplementedError(
-            "CountOver Druid lowering ships in Phase 2; do not call directly."
+            "CountOver lowering happens in DruidQueryTransformer.transform(); "
+            "call operator_metadata_for() to get structural metadata instead."
         )
