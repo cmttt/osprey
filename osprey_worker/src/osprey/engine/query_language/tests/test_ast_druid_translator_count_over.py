@@ -2,7 +2,6 @@
 from typing import Any, Callable, List
 
 import pytest
-from osprey.engine.ast import grammar
 from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
 from osprey.engine.ast_validator.validators.unique_stored_names import UniqueStoredNames
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
@@ -11,7 +10,7 @@ from osprey.engine.ast_validator.validators.validate_dynamic_calls_have_annotate
 )
 from osprey.engine.ast_validator.validators.validate_static_types import ValidateStaticTypes
 from osprey.engine.ast_validator.validators.variables_must_be_defined import VariablesMustBeDefined
-from osprey.engine.conftest import CheckJsonOutputFunction, RunValidationFunction
+from osprey.engine.conftest import CheckJsonOutputFunction
 from osprey.engine.query_language import parse_query_to_validated_ast
 from osprey.engine.query_language.ast_druid_translator import DruidQueryTransformer
 from osprey.engine.query_language.tests.conftest import MakeRulesSourcesFunction
@@ -45,200 +44,163 @@ except Exception:
     pass
 
 
-def test_count_over_gte_with_key_smoke(
-    run_validation: RunValidationFunction,
-) -> None:
-    """Smoke test: CountOver(...) >= N should produce SQL (tagged shape), not native filter."""
-    # Validate the full query expression (rules + query combined)
-    validated_sources = run_validation(
-        """
-A = 'hello'
-UserId = 'UserId'
-result = CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) >= 5
-"""
-    )
-
-    # Debugging: Check what statements we have
-    statements = validated_sources.sources.get_entry_point().ast_root.statements
-    result_assign = None
-    for stmt in statements:
-        if isinstance(stmt, grammar.Assign) and stmt.target.identifier == 'result':
-            result_assign = stmt
-            break
-
-    # For the transformer test, we need to manually pass the CountOver comparison
-    # as self._root, bypassing the normal statement[0] logic
-    # Create a custom transformer that uses the result assignment
-    if result_assign is None:
-        pytest.skip("Could not find 'result' assignment in validated sources")
-
-    # Manually construct the transformer with the correct root
-    transformer = DruidQueryTransformer(validated_sources=validated_sources)
-    # Override the root to use the result assignment's value
-    transformer._root = result_assign.value
-
-    transformed_query = transformer.transform()
-
-    # Should be tagged SQL shape, not native filter shape
-    assert isinstance(transformed_query, dict)
-    assert 'type' in transformed_query, f"Expected 'type' key in response: {transformed_query}"
-    assert transformed_query['type'] == 'sql', f"Expected type='sql', got {transformed_query.get('type')}"
-    assert 'sql' in transformed_query, f"Expected 'sql' key in response: {transformed_query}"
-    assert isinstance(transformed_query['sql'], str)
-
-    # Minimal SQL structure check: should contain SELECT, LAG, and window spec
-    sql = transformed_query['sql'].upper()
-    assert 'SELECT' in sql, f"SQL should contain SELECT. Got: {transformed_query['sql']}"
-    assert 'LAG' in sql, f"SQL should contain LAG window function. Got: {transformed_query['sql']}"
-    assert 'OVER' in sql, f"SQL should contain OVER clause. Got: {transformed_query['sql']}"
-    assert 'PARTITION BY' in sql, f"SQL should contain PARTITION BY (with key). Got: {transformed_query['sql']}"
-
-
 # Snapshot tests for all 13 cases (6 ops × 2 keying variants + AND filter case)
 
 
 def test_count_over_gte_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) >= 10"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) >= 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) >= 10",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) >= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_gt_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) > 10"""
+    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) > 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) > 10",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'")]),
+        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) > 10",
+        make_rules_sources([('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_eq_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) == 10"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1' and Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) == 10 (with key, AND predicate)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) == 10",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1' and Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) == 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_neq_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) != 10"""
+    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) != 5 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) != 10",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'")]),
+        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) != 5",
+        make_rules_sources([('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_lte_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) <= 10"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) <= 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) <= 10",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) <= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_lt_with_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) < 10"""
+    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) < 10 (with key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) < 10",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'")]),
+        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10), key=UserId) < 10",
+        make_rules_sources([('Endpoint', "'/foo'"), ('UserId', "'123'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_gte_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) >= 10 (no key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) >= 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) >= 10",
-        make_rules_sources([('A', "'hello'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) >= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_gt_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) > 10 (no key)"""
+    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) > 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) > 10",
-        make_rules_sources([('A', "'hello'")]),
+        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) > 10",
+        make_rules_sources([('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_eq_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) == 10 (no key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1' or Endpoint == '/foo', window=TimeDelta(minutes=10)) == 10 (no key, OR predicate)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) == 10",
-        make_rules_sources([('A', "'hello'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1' or Endpoint == '/foo', window=TimeDelta(minutes=10)) == 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_neq_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) != 10 (no key)"""
+    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) != 5 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) != 10",
-        make_rules_sources([('A', "'hello'")]),
+        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) != 5",
+        make_rules_sources([('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_lte_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) <= 10 (no key)"""
+    """CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) <= 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) <= 10",
-        make_rules_sources([('A', "'hello'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10)) <= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_lt_no_key(
     make_rules_sources: MakeRulesSourcesFunction, check_json_output: CheckJsonOutputFunction
 ) -> None:
-    """CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) < 10 (no key)"""
+    """CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) < 10 (no key)"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10)) < 10",
-        make_rules_sources([('A', "'hello'")]),
+        "CountOver(predicate=Endpoint == '/foo', window=TimeDelta(minutes=10)) < 10",
+        make_rules_sources([('Endpoint', "'/foo'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
 
 
 def test_count_over_with_and_filter(
@@ -246,11 +208,50 @@ def test_count_over_with_and_filter(
 ) -> None:
     """CountOver(...) >= 10 and Country != 'US' - verifies AND-conjunct folding"""
     validated_sources = parse_query_to_validated_ast(
-        "CountOver(predicate=A == 'hello', window=TimeDelta(minutes=10), key=UserId) >= 10 and Country != 'US'",
-        make_rules_sources([('A', "'hello'"), ('UserId', "'UserId'"), ('Country', "'someCountry'")]),
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window=TimeDelta(minutes=10), key=UserId) >= 10 and Country != 'US'",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'"), ('Country', "'someCountry'")]),
     )
     transformed_query = DruidQueryTransformer(validated_sources=validated_sources).transform()
     assert check_json_output(transformed_query)
+    _assert_valid_count_over_sql(transformed_query)
+
+
+def _assert_valid_count_over_sql(transformed_query: Any) -> None:
+    """Assert the transformed query contains valid CountOver SQL.
+
+    Checks:
+    - Type is 'sql'
+    - SQL string is present
+    - No doubled FROM clauses (check by counting FROM after first SELECT *, before first WHERE in parentheses)
+    - No literal {operand_str} f-string placeholders
+    - Balanced parentheses
+    """
+    assert isinstance(transformed_query, dict), f"Expected dict, got {type(transformed_query)}"
+    assert transformed_query.get('type') == 'sql', f"Expected type='sql', got {transformed_query.get('type')}"
+
+    sql = transformed_query.get('sql', '')
+    assert isinstance(sql, str) and sql, "Expected non-empty SQL string"
+
+    # Check for doubled FROM clause bug (Critical 1)
+    # The pattern should be: SELECT * FROM (SELECT *, LAG(...) FROM datasource WHERE ...) WHERE ...
+    # Not: SELECT * FROM (SELECT *, LAG(...) FROM __default FROM datasource WHERE ...) WHERE ...
+    # So we look for the doubling pattern specifically
+    assert ' FROM __default FROM ' not in sql.upper(), f"Found doubled FROM clause (FROM __default FROM). SQL: {sql}"
+    assert 'FROM datasource' in sql, f"Expected 'FROM datasource' in SQL. SQL: {sql}"
+
+    # Check for f-string bug (Critical 2) - literal {operand_str}
+    assert '{operand_str}' not in sql, f"Found literal {{operand_str}} in SQL (f-string bug). SQL: {sql}"
+    assert '{' not in sql or '}' not in sql, f"Found unresolved placeholder in SQL. SQL: {sql}"
+
+    # Check parentheses are balanced
+    paren_count = 0
+    for char in sql:
+        if char == '(':
+            paren_count += 1
+        elif char == ')':
+            paren_count -= 1
+        assert paren_count >= 0, f"Unbalanced parentheses in SQL (more closing than opening). SQL: {sql}"
+    assert paren_count == 0, f"Unbalanced parentheses in SQL (unclosed). SQL: {sql}"
 
 
 

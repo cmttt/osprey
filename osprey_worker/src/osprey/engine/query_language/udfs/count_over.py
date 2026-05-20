@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Type
 
+from osprey.engine.ast import grammar
 from osprey.engine.language_types.time_delta import TimeDeltaT
 from osprey.engine.query_language.udfs.registry import register
 from osprey.engine.udf.arguments import ArgumentsBase
@@ -42,8 +43,6 @@ def operator_metadata_for(comparator_type: Type[object], threshold: int) -> Oper
     Raises:
         ValueError: If the comparator_type is not one of the six supported operators.
     """
-    # Import here to avoid circular imports
-    from osprey.engine.ast import grammar
 
     if comparator_type == grammar.GreaterThanEquals:
         # >= N: LAG(__time, N-1) AS pt1 + check pt1 exists within window

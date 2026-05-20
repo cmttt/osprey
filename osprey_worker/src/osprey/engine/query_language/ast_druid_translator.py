@@ -175,7 +175,8 @@ class DruidQueryTransformer:
                 if val is not None:
                     total_seconds += val
 
-        return total_seconds if total_seconds > 0 else None
+        # Return the total even if it's 0; validation of window > 0 is Phase 1's job
+        return total_seconds
 
     def _extract_key(self, call: grammar.Call) -> Optional[str]:
         """Extract the key argument (partition column name) from a CountOver call."""
@@ -222,7 +223,8 @@ class DruidQueryTransformer:
         lag_select = ', '.join(lag_columns)
 
         # Build the inner SELECT (with LAG columns)
-        inner_select = f"SELECT *, {lag_select} FROM __default FROM datasource WHERE {where_clause}"
+        # datasource is a placeholder that Smite-side will rewrite to the actual datasource name
+        inner_select = f"SELECT *, {lag_select} FROM datasource WHERE {where_clause}"
 
         # Build the post-filter SQL
         post_filter = metadata.post_filter_template.format(window_seconds=window_seconds)
@@ -248,7 +250,7 @@ class DruidQueryTransformer:
             else:
                 raise NotImplementedError(f"Unsupported boolean operand: {type(node.operand)}")
             parts = [self._predicate_to_sql(v) for v in node.values]
-            return f"({' {operand_str} '.join(parts)})"
+            return f"({operand_str.join(parts)})"
         elif isinstance(node, grammar.UnaryOperation):
             if isinstance(node.operator, grammar.Not):
                 inner = self._predicate_to_sql(node.operand)
