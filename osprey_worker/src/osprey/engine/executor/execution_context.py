@@ -4,6 +4,7 @@ import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -19,8 +20,6 @@ from typing import (
     TypeAlias,
     TypeVar,
 )
-
-from functools import lru_cache
 
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -53,6 +52,8 @@ if TYPE_CHECKING:
 try:
     from osprey.async_worker.lib.external_service import (
         AsyncExternalService,
+    )
+    from osprey.async_worker.lib.external_service import (
         ExternalServiceAccessor as AsyncExternalServiceAccessor,
     )
 except ImportError:
@@ -64,6 +65,7 @@ from osprey.engine.language_types.effects import (
     EffectBase,
     EffectToCustomExtractedFeatureBase,
 )
+from osprey.engine.language_types.labels import LabelEffect, LabelStatus
 from osprey.engine.language_types.post_execution_convertible import PostExecutionConvertible
 from osprey.engine.language_types.verdicts import VerdictEffect
 from osprey.engine.utils.types import add_slots, cached_property
@@ -464,10 +466,27 @@ class ExecutionResult:
         returns a pb2 protobuf of the verdicts declared by the action, along with some extra metadata~
         ╰(*°▽°*)╯
         """
+        verdicts = [v.verdict for v in self.verdicts]
+        # Synthesize entity verdicts from LabelAdd effects so callers reading
+        # entity_has_label() on a sync ProcessAction response see labels
+        # applied during this action. An earlier coordinator protocol carried
+        # entity labels in a separate response field; the current protocol
+        # exposes only verdicts, and this synthesis restores the prior caller
+        # contract for the common case of LabelAdd-only rules.
+        for label_effect in self.effects.get(LabelEffect, []):
+            if label_effect.suppressed:
+                continue
+            if label_effect.dependent_rule is not None and not label_effect.dependent_rule.value:
+                continue
+            if label_effect.status != LabelStatus.ADDED:
+                continue
+            verdicts.append(
+                f'{label_effect.entity.type}/{label_effect.entity.id}/{label_effect.name}'
+            )
         return Verdicts(
             action_id=self.action.action_id,
             action_name=self.action.action_name,
-            verdicts=[v.verdict for v in self.verdicts],
+            verdicts=verdicts,
             timestamp=self._get_timestamp_pb2_proto(),
         )
 
