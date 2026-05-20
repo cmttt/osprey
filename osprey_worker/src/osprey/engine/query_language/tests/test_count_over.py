@@ -45,6 +45,7 @@ def test_count_over_to_druid_query_raises_not_implemented(run_validation: RunVal
     assert count_over_call is not None, "CountOver call node not found in AST"
 
     count_over_udf, _ = udf_mapping[id(count_over_call)]
+    assert isinstance(count_over_udf, CountOver)
 
     with pytest.raises(NotImplementedError, match="CountOver Druid lowering ships in Phase 2"):
         count_over_udf.to_druid_query()
