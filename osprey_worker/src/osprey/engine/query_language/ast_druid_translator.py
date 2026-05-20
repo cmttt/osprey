@@ -5,7 +5,7 @@ from osprey.engine.ast_validator.validation_context import ValidatedSources
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
 from osprey.engine.udf.base import QueryUdfBase
 from osprey.engine.utils.osprey_unary_executor import OspreyUnaryExecutor
-from osprey.engine.query_language.udfs.count_over import operator_metadata_for
+from osprey.engine.query_language.udfs.count_over import operator_metadata_for, CountOver
 from osprey.engine.stdlib.udfs.time_delta import TimeDelta
 
 
@@ -105,7 +105,6 @@ class DruidQueryTransformer:
 
         # Get the UDF to verify it's the CountOver UDF
         udf, _ = self._udf_node_mapping.get(id(count_over_call), (None, None))
-        from osprey.engine.query_language.udfs.count_over import CountOver
         if not isinstance(udf, CountOver):
             return None
 
