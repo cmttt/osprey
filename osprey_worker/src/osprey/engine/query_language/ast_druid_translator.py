@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from osprey.engine.ast import grammar
@@ -7,6 +8,26 @@ from osprey.engine.ast_validator.validators.validate_call_kwargs import Validate
 from osprey.engine.udf.base import QueryUdfBase
 from osprey.engine.utils.osprey_unary_executor import OspreyUnaryExecutor
 from osprey.engine.query_language.udfs.count_over import operator_metadata_for, CountOver
+
+
+# Output modes for `DruidQueryTransformer.transform()` when lowering CountOver
+# into SQL. Each mode emits a different outer shape suitable for a particular
+# Druid consumer.
+COUNT_OVER_OUTPUT_INNER = 'inner'
+COUNT_OVER_OUTPUT_SCAN = 'scan'
+COUNT_OVER_OUTPUT_TIMESERIES = 'timeseries'
+_COUNT_OVER_OUTPUT_MODES = (COUNT_OVER_OUTPUT_INNER, COUNT_OVER_OUTPUT_SCAN, COUNT_OVER_OUTPUT_TIMESERIES)
+
+
+def _format_druid_timestamp_literal(dt: datetime) -> str:
+    """Format a datetime for a Druid Calcite `TIMESTAMP 'yyyy-MM-dd HH:mm:ss'` literal.
+
+    Calcite rejects ISO 8601 `T` separators and any UTC offset suffix (e.g.
+    `+00:00`), so tz-aware inputs are normalized to naive UTC first.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
 
 
 class DruidQueryTransformException(Exception):
@@ -25,9 +46,39 @@ class DruidQueryTransformer:
     behavior where callers substitute the placeholder themselves; pass a real
     Druid datasource name (e.g. `'smite.events'`) to get executable SQL.
     The name is quoted in the SQL output to support names containing `.`.
+
+    Output-shape parameters control whether the emitted SQL is ready to run
+    against Druid or just the inner CountOver shape:
+
+    - `output_mode='inner'` (default) emits `SELECT * FROM (<lag-subquery>) AS
+      __inner WHERE <post>` — the original CountOver shape. Callers wrap it
+      themselves.
+    - `output_mode='scan'` requires `time_bounds`. Emits a SCAN-style outer
+      wrap: `SELECT * FROM (<inner>) AS __t WHERE __time >= TIMESTAMP '<start>'
+      AND __time < TIMESTAMP '<end>'`.
+    - `output_mode='timeseries'` requires `time_bounds` and
+      `granularity_period` (ISO 8601 period like `'PT1H'`). Emits
+      `SELECT TIME_FLOOR(__time, '<period>') AS bucket, COUNT(*) AS cnt
+      FROM (<inner>) AS __t WHERE <time-bound> GROUP BY 1 ORDER BY 1`.
     """
 
-    def __init__(self, validated_sources: ValidatedSources, datasource_name: str = 'datasource'):
+    def __init__(
+        self,
+        validated_sources: ValidatedSources,
+        datasource_name: str = 'datasource',
+        output_mode: str = COUNT_OVER_OUTPUT_INNER,
+        time_bounds: Optional[Tuple[datetime, datetime]] = None,
+        granularity_period: Optional[str] = None,
+    ):
+        if output_mode not in _COUNT_OVER_OUTPUT_MODES:
+            raise ValueError(
+                f'output_mode must be one of {_COUNT_OVER_OUTPUT_MODES}; got {output_mode!r}'
+            )
+        if output_mode != COUNT_OVER_OUTPUT_INNER and time_bounds is None:
+            raise ValueError(f'output_mode={output_mode!r} requires time_bounds')
+        if output_mode == COUNT_OVER_OUTPUT_TIMESERIES and not granularity_period:
+            raise ValueError("output_mode='timeseries' requires granularity_period (ISO 8601, e.g. 'PT1H')")
+
         try:
             self._udf_node_mapping = validated_sources.get_validator_result(ValidateCallKwargs)
         except KeyError:
@@ -37,6 +88,9 @@ class DruidQueryTransformer:
         assert isinstance(assign_node, grammar.Assign)
         self._root = assign_node.value
         self._datasource_name = datasource_name
+        self._output_mode = output_mode
+        self._time_bounds = time_bounds
+        self._granularity_period = granularity_period
 
     def transform(self) -> Dict[str, Any]:
         """Transform AST to Druid query.
@@ -48,11 +102,46 @@ class DruidQueryTransformer:
         count_over_info = self._detect_count_over(self._root)
         if count_over_info:
             predicate, window_seconds, key, comparator_type, threshold, other_conjuncts = count_over_info
-            sql = self._compose_count_over_sql(predicate, window_seconds, key, comparator_type, threshold, other_conjuncts)
+            inner_sql = self._compose_count_over_sql(
+                predicate, window_seconds, key, comparator_type, threshold, other_conjuncts
+            )
+            sql = self._apply_output_wrap(inner_sql)
             return {'type': 'sql', 'sql': sql}
 
         # Fall through to native query transformation
         return {'type': 'native', 'filter': self._transform(self._root)}
+
+    def _apply_output_wrap(self, inner_sql: str) -> str:
+        """Wrap the inner CountOver SQL according to `self._output_mode`."""
+        if self._output_mode == COUNT_OVER_OUTPUT_INNER:
+            return inner_sql
+
+        # Both SCAN and TIMESERIES need the time-bound WHERE clause.
+        assert self._time_bounds is not None  # validated in __init__
+        start, end = self._time_bounds
+        start_lit = _format_druid_timestamp_literal(start)
+        end_lit = _format_druid_timestamp_literal(end)
+        time_where = (
+            f"__time >= TIMESTAMP '{start_lit}' "
+            f"AND __time < TIMESTAMP '{end_lit}'"
+        )
+
+        if self._output_mode == COUNT_OVER_OUTPUT_SCAN:
+            # SCAN: just project everything and apply the time bound. Calcite
+            # requires `AS __t` on the outer FROM subquery.
+            return f"SELECT * FROM ({inner_sql}) AS __t WHERE {time_where}"
+
+        # TIMESERIES: bucket by TIME_FLOOR and count. The native timeseries
+        # consumer expects `[{timestamp, result: {count}}, ...]`; we emit
+        # rows of `{bucket, cnt}` which the caller can adapt.
+        assert self._granularity_period is not None  # validated in __init__
+        return (
+            f"SELECT TIME_FLOOR(__time, '{self._granularity_period}') AS bucket, "
+            f"COUNT(*) AS cnt "
+            f"FROM ({inner_sql}) AS __t "
+            f"WHERE {time_where} "
+            f"GROUP BY 1 ORDER BY 1"
+        )
 
     def _detect_count_over(
         self, node: grammar.ASTNode
