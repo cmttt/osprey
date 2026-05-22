@@ -226,6 +226,100 @@ def test_count_over_custom_datasource_name(
     assert ') AS __inner WHERE' in sql
 
 
+def test_count_over_scan_output_wraps_with_time_bounds(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """`output_mode='scan'` wraps the inner CountOver SQL with the outer time
+    bound (Calcite needs `AS __t` on the outer FROM subquery) so the result
+    is executable directly against Druid."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) >= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
+    )
+    start = datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 20, 1, 0, 0, tzinfo=timezone.utc)
+
+    transformed_query = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        output_mode='scan',
+        time_bounds=(start, end),
+    ).transform()
+    sql = transformed_query['sql']
+
+    # Outer wrap with __t alias and tz-stripped TIMESTAMP literals.
+    assert ') AS __t WHERE' in sql
+    assert "__time >= TIMESTAMP '2026-05-20 00:00:00'" in sql
+    assert "__time < TIMESTAMP '2026-05-20 01:00:00'" in sql
+    assert '+00:00' not in sql  # tz suffix must be stripped
+
+
+def test_count_over_timeseries_output_wraps_with_time_floor(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """`output_mode='timeseries'` wraps the inner CountOver SQL with
+    `TIME_FLOOR + COUNT(*) GROUP BY` so the result is ready for a
+    timeseries-shaped consumer."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m', key=UserId) >= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'"), ('UserId', "'123'")]),
+    )
+    start = datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 20, 2, 0, 0, tzinfo=timezone.utc)
+
+    transformed_query = DruidQueryTransformer(
+        validated_sources=validated_sources,
+        datasource_name='smite.events',
+        output_mode='timeseries',
+        time_bounds=(start, end),
+        granularity_period='PT1H',
+    ).transform()
+    sql = transformed_query['sql']
+
+    assert "TIME_FLOOR(__time, 'PT1H') AS bucket" in sql
+    assert 'COUNT(*) AS cnt' in sql
+    assert 'GROUP BY 1 ORDER BY 1' in sql
+    assert "__time >= TIMESTAMP '2026-05-20 00:00:00'" in sql
+    assert "__time < TIMESTAMP '2026-05-20 02:00:00'" in sql
+
+
+def test_count_over_output_mode_validation(
+    make_rules_sources: MakeRulesSourcesFunction,
+) -> None:
+    """Constructor validates output_mode and required companion args eagerly,
+    so callers don't get a confusing error mid-transform."""
+    from datetime import datetime, timezone
+
+    validated_sources = parse_query_to_validated_ast(
+        "CountOver(predicate=UserLoginIp == '1.1.1.1', window='10m') >= 10",
+        make_rules_sources([('UserLoginIp', "'1.1.1.1'")]),
+    )
+    start = datetime(2026, 5, 20, 0, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 20, 1, 0, 0, tzinfo=timezone.utc)
+
+    # Unknown output_mode
+    with pytest.raises(ValueError, match='output_mode'):
+        DruidQueryTransformer(validated_sources=validated_sources, output_mode='bogus')
+
+    # 'scan' requires time_bounds
+    with pytest.raises(ValueError, match='time_bounds'):
+        DruidQueryTransformer(validated_sources=validated_sources, output_mode='scan')
+
+    # 'timeseries' requires both time_bounds and granularity_period
+    with pytest.raises(ValueError, match='time_bounds'):
+        DruidQueryTransformer(validated_sources=validated_sources, output_mode='timeseries')
+    with pytest.raises(ValueError, match='granularity_period'):
+        DruidQueryTransformer(
+            validated_sources=validated_sources,
+            output_mode='timeseries',
+            time_bounds=(start, end),
+        )
+
+
 def _assert_valid_count_over_sql(transformed_query: Any) -> None:
     """Assert the transformed query contains valid CountOver SQL.
 
