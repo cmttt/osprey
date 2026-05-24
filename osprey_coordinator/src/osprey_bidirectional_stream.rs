@@ -326,6 +326,7 @@ mod tests {
             secret_data: Some(SecretData::JsonSecretData(
                 "{\"secret\": \"test secret data 1\"}".into(),
             )),
+            mode: 0, // EXECUTION_MODE_UNSPECIFIED
         };
         let (ackable_action, _receiver_drop_guard_1) = AckableAction::new(ackable_action);
         priority_queue_sender
@@ -344,6 +345,7 @@ mod tests {
             secret_data: Some(SecretData::JsonSecretData(
                 "{\"secret\": \"test secret data 2\"}".into(),
             )),
+            mode: 0, // EXECUTION_MODE_UNSPECIFIED
         };
         let (ackable_action, _receiver_drop_guard_2) = AckableAction::new(ackable_action_2);
         priority_queue_sender

@@ -73,6 +73,7 @@ async fn create_osprey_coordinator_action(
                 .context("`timestamp` not found")?
                 .clone(),
         ),
+        mode: 0, // EXECUTION_MODE_UNSPECIFIED; set by coordinator when tier is known
     };
 
     Ok(osprey_coordinator_action)

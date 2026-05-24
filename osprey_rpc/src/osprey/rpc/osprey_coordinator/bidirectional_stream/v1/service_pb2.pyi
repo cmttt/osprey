@@ -5,13 +5,41 @@ isort:skip_file
 
 import builtins
 import google.protobuf.descriptor
+import google.protobuf.internal.enum_type_wrapper
 import google.protobuf.message
 import google.protobuf.timestamp_pb2
 import osprey.rpc.common.v1.execution_result_pb2
 import osprey.rpc.common.v1.verdicts_pb2
+import sys
 import typing
 
+if sys.version_info >= (3, 10):
+    import typing as typing_extensions
+else:
+    import typing_extensions
+
 DESCRIPTOR: google.protobuf.descriptor.FileDescriptor
+
+class _ExecutionMode:
+    ValueType = typing.NewType("ValueType", builtins.int)
+    V: typing_extensions.TypeAlias = ValueType
+
+class _ExecutionModeEnumTypeWrapper(google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[_ExecutionMode.ValueType], builtins.type):
+    DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+    EXECUTION_MODE_UNSPECIFIED: _ExecutionMode.ValueType  # 0
+    EXECUTION_MODE_SYNC: _ExecutionMode.ValueType  # 1
+    EXECUTION_MODE_ASYNC: _ExecutionMode.ValueType  # 2
+
+class ExecutionMode(_ExecutionMode, metaclass=_ExecutionModeEnumTypeWrapper):
+    """Execution mode tells the worker which latency tier an action originated from.
+    MODE_UNSPECIFIED means the producer is an older binary that doesn't stamp mode;
+    the worker treats it as "no tier filtering" for backward compatibility.
+    """
+
+EXECUTION_MODE_UNSPECIFIED: ExecutionMode.ValueType  # 0
+EXECUTION_MODE_SYNC: ExecutionMode.ValueType  # 1
+EXECUTION_MODE_ASYNC: ExecutionMode.ValueType  # 2
+global___ExecutionMode = ExecutionMode
 
 @typing.final
 class OspreyCoordinatorAction(google.protobuf.message.Message):
@@ -24,6 +52,7 @@ class OspreyCoordinatorAction(google.protobuf.message.Message):
     PROTO_ACTION_DATA_FIELD_NUMBER: builtins.int
     JSON_SECRET_DATA_FIELD_NUMBER: builtins.int
     TIMESTAMP_FIELD_NUMBER: builtins.int
+    MODE_FIELD_NUMBER: builtins.int
     ack_id: builtins.int
     action_id: builtins.int
     action_name: builtins.str
@@ -31,6 +60,7 @@ class OspreyCoordinatorAction(google.protobuf.message.Message):
     proto_action_data: builtins.bytes
     json_secret_data: builtins.bytes
     """this will soon be replaced by proto refactors"""
+    mode: global___ExecutionMode.ValueType
     @property
     def timestamp(self) -> google.protobuf.timestamp_pb2.Timestamp: ...
     def __init__(
@@ -43,9 +73,10 @@ class OspreyCoordinatorAction(google.protobuf.message.Message):
         proto_action_data: builtins.bytes = ...,
         json_secret_data: builtins.bytes = ...,
         timestamp: google.protobuf.timestamp_pb2.Timestamp | None = ...,
+        mode: global___ExecutionMode.ValueType = ...,
     ) -> None: ...
     def HasField(self, field_name: typing.Literal["action_data", b"action_data", "json_action_data", b"json_action_data", "json_secret_data", b"json_secret_data", "proto_action_data", b"proto_action_data", "secret_data", b"secret_data", "timestamp", b"timestamp"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["ack_id", b"ack_id", "action_data", b"action_data", "action_id", b"action_id", "action_name", b"action_name", "json_action_data", b"json_action_data", "json_secret_data", b"json_secret_data", "proto_action_data", b"proto_action_data", "secret_data", b"secret_data", "timestamp", b"timestamp"]) -> None: ...
+    def ClearField(self, field_name: typing.Literal["ack_id", b"ack_id", "action_data", b"action_data", "action_id", b"action_id", "action_name", b"action_name", "json_action_data", b"json_action_data", "json_secret_data", b"json_secret_data", "mode", b"mode", "proto_action_data", b"proto_action_data", "secret_data", b"secret_data", "timestamp", b"timestamp"]) -> None: ...
     @typing.overload
     def WhichOneof(self, oneof_group: typing.Literal["action_data", b"action_data"]) -> typing.Literal["json_action_data", "proto_action_data"] | None: ...
     @typing.overload

@@ -41,6 +41,7 @@ pub async fn decode_proto_message(
         action_data: Some(ActionData::ProtoActionData(message_data.into())),
         secret_data: None,
         timestamp: Some(message_timestamp),
+        mode: 0, // EXECUTION_MODE_UNSPECIFIED; set by coordinator when tier is known
     })
 }
 
@@ -86,5 +87,6 @@ pub async fn decode_msgpack_json_message(
         action_data: Some(ActionData::JsonActionData(serde_json_vec)),
         secret_data: optional_secret_data,
         timestamp: Some(message_timestamp),
+        mode: 0, // EXECUTION_MODE_UNSPECIFIED; set by coordinator when tier is known
     })
 }
