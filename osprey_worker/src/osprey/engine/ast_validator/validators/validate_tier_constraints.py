@@ -5,7 +5,7 @@ Two rules:
 2. State-mutating effects (mutates_state=True) forbidden in tier=both WhenRules.
 
 State-mutating effects in tier=both would emit on both sync and async paths,
-causing duplicate writes to labels-service, Safety Record, etc.
+causing duplicate writes to downstream stores.
 
 The validator walks each WhenRules call's transitive UDF dependency graph (for
 constraint 1) and inspects the effects list (for constraint 2).

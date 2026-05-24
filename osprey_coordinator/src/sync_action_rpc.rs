@@ -211,7 +211,7 @@ mod sync_action_mode_tests {
         // Use a non-zero action_id so the helper skips the snowflake network call.
         let req = ProcessActionRequest {
             action_id: Some(123_u64),
-            action_name: "USER_REGISTER_ATTEMPTED".to_string(),
+            action_name: "TEST_ACTION_A".to_string(),
             action_data_json: r#"{"foo":"bar"}"#.to_string(),
             timestamp: Some(prost_types::Timestamp {
                 seconds: 1_700_000_000,
@@ -235,7 +235,7 @@ mod sync_action_mode_tests {
             ExecutionMode::Sync as i32,
             "sync RPC must stamp ExecutionMode::Sync on the bidi-stream action"
         );
-        assert_eq!(action.action_name, "USER_REGISTER_ATTEMPTED");
+        assert_eq!(action.action_name, "TEST_ACTION_A");
         assert_eq!(action.ack_id, 999);
     }
 }

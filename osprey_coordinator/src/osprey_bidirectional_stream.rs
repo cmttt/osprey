@@ -451,7 +451,7 @@ mod execution_mode_tests {
         let old_msg = OspreyCoordinatorAction {
             ack_id: 42,
             action_id: 100,
-            action_name: "USER_REGISTER_ATTEMPTED".to_string(),
+            action_name: "TEST_ACTION_A".to_string(),
             action_data: None,
             secret_data: None,
             timestamp: None,
@@ -463,7 +463,7 @@ mod execution_mode_tests {
         let decoded = OspreyCoordinatorAction::decode(&encoded[..]).unwrap();
 
         assert_eq!(decoded.mode, ExecutionMode::Unspecified as i32);
-        assert_eq!(decoded.action_name, "USER_REGISTER_ATTEMPTED");
+        assert_eq!(decoded.action_name, "TEST_ACTION_A");
         assert_eq!(decoded.ack_id, 42);
         assert_eq!(decoded.action_id, 100);
     }
@@ -473,7 +473,7 @@ mod execution_mode_tests {
         let msg = OspreyCoordinatorAction {
             ack_id: 1,
             action_id: 2,
-            action_name: "GUILD_JOIN_ATTEMPTED".to_string(),
+            action_name: "TEST_ACTION_B".to_string(),
             action_data: None,
             secret_data: None,
             timestamp: None,
@@ -483,7 +483,7 @@ mod execution_mode_tests {
         msg.encode(&mut encoded).unwrap();
         let decoded = OspreyCoordinatorAction::decode(&encoded[..]).unwrap();
         assert_eq!(decoded.mode, ExecutionMode::Sync as i32);
-        assert_eq!(decoded.action_name, "GUILD_JOIN_ATTEMPTED");
+        assert_eq!(decoded.action_name, "TEST_ACTION_B");
     }
 
     #[test]
@@ -491,7 +491,7 @@ mod execution_mode_tests {
         let msg = OspreyCoordinatorAction {
             ack_id: 1,
             action_id: 2,
-            action_name: "GUILD_JOINED".to_string(),
+            action_name: "TEST_ACTION_C".to_string(),
             action_data: None,
             secret_data: None,
             timestamp: None,

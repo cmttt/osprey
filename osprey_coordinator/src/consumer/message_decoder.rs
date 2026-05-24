@@ -138,10 +138,10 @@ mod async_ingest_mode_tests {
     async fn msgpack_ingest_stamps_mode_async() {
         use msgpack_simple::MsgPack;
 
-        // Construct a msgpack-encoded action as discord-api's submit_async() publishes it.
+        // Construct a msgpack-encoded action as the upstream pubsub publisher publishes it.
         let action_json = serde_json::json!({
             "id": "999000111000222000",
-            "name": "GUILD_JOINED",
+            "name": "TEST_ACTION_C",
             "data": {"user_id": "999000111000222001", "guild_id": "888777666555444333"},
         });
         let encoded = MsgPack::String(action_json.to_string()).encode();
@@ -161,6 +161,6 @@ mod async_ingest_mode_tests {
             ExecutionMode::Async as i32,
             "pubsub msgpack-ingest must stamp ExecutionMode::Async"
         );
-        assert_eq!(result.action_name, "GUILD_JOINED");
+        assert_eq!(result.action_name, "TEST_ACTION_C");
     }
 }

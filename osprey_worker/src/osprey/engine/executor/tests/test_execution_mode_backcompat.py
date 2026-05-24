@@ -8,7 +8,7 @@ def test_action_defaults_execution_mode_to_unspecified():
     from osprey.engine.executor.execution_context import Action
     a = Action(
         action_id=1,
-        action_name="USER_REGISTER_ATTEMPTED",
+        action_name="TEST_ACTION_A",
         data={"foo": "bar"},
         timestamp=datetime(2026, 1, 1),
     )
@@ -19,7 +19,7 @@ def test_action_accepts_sync_mode():
     from osprey.engine.executor.execution_context import Action
     a = Action(
         action_id=1,
-        action_name="USER_REGISTER_ATTEMPTED",
+        action_name="TEST_ACTION_A",
         data={},
         timestamp=datetime(2026, 1, 1),
         execution_mode="sync",
@@ -31,7 +31,7 @@ def test_action_accepts_async_mode():
     from osprey.engine.executor.execution_context import Action
     a = Action(
         action_id=1,
-        action_name="GUILD_JOINED",
+        action_name="TEST_ACTION_C",
         data={},
         timestamp=datetime(2026, 1, 1),
         execution_mode="async",
@@ -43,7 +43,7 @@ def test_action_to_dict_roundtrips_execution_mode():
     from osprey.engine.executor.execution_context import Action
     a = Action(
         action_id=1,
-        action_name="GUILD_JOIN_ATTEMPTED",
+        action_name="TEST_ACTION_B",
         data={"x": 1},
         timestamp=datetime(2026, 1, 1),
         execution_mode="sync",
@@ -57,7 +57,7 @@ def test_action_from_dict_defaults_when_absent():
     from osprey.engine.executor.execution_context import Action
     a = Action.from_dict({
         "action_id": 42,
-        "action_name": "USER_LOGIN_ATTEMPTED",
+        "action_name": "TEST_ACTION_D",
         "data": {},
         "timestamp": "2026-01-01T00:00:00",
     })
@@ -68,7 +68,7 @@ def test_action_from_dict_reads_execution_mode_when_present():
     from osprey.engine.executor.execution_context import Action
     a = Action.from_dict({
         "action_id": 42,
-        "action_name": "GUILD_JOINED",
+        "action_name": "TEST_ACTION_C",
         "data": {},
         "timestamp": "2026-01-01T00:00:00",
         "execution_mode": "async",
@@ -112,7 +112,7 @@ def test_create_osprey_engine_action_threads_sync_mode():
     stream = _make_input_stream()
     mock_msg = _make_mock_coordinator_action(
         action_id=100,
-        action_name="USER_REGISTER_ATTEMPTED",
+        action_name="TEST_ACTION_A",
         json_data=b'{"foo": "bar"}',
         timestamp_seconds=1700000000,
         mode=1,  # SYNC
@@ -122,14 +122,14 @@ def test_create_osprey_engine_action_threads_sync_mode():
 
     assert action is not None
     assert action.execution_mode == 'sync'
-    assert action.action_name == 'USER_REGISTER_ATTEMPTED'
+    assert action.action_name == 'TEST_ACTION_A'
 
 
 def test_create_osprey_engine_action_threads_async_mode():
     stream = _make_input_stream()
     mock_msg = _make_mock_coordinator_action(
         action_id=100,
-        action_name="GUILD_JOINED",
+        action_name="TEST_ACTION_C",
         json_data=b'{}',
         timestamp_seconds=1700000000,
         mode=2,  # ASYNC
@@ -147,7 +147,7 @@ def test_create_osprey_engine_action_unspecified_for_legacy_messages():
     stream = _make_input_stream()
     mock_msg = _make_mock_coordinator_action(
         action_id=100,
-        action_name="USER_LOGIN_ATTEMPTED",
+        action_name="TEST_ACTION_D",
         json_data=b'{}',
         timestamp_seconds=1700000000,
         mode=0,  # UNSPECIFIED (legacy)
