@@ -93,6 +93,18 @@ class UDFBase(Generic[Arguments, RValue], ABC):
     """If present, a string name for what category this UDF falls into. Can be used for, say, grouping UDFs
     in documentation."""
 
+    latency_tier: ClassVar[str] = 'fast'
+    """Latency tier of this UDF for tier-routing validation:
+    - 'fast' (default): the UDF is acceptable on the sync path. Typical examples:
+      BigTable reads, label lookups, in-process computation, fast gRPC calls (<200ms p95).
+    - 'slow': the UDF makes a high-latency call (>500ms p95). The Phase 3 validator
+      forbids slow UDFs in WhenRules with tier='sync', tier='both', or tier='legacy'
+      to prevent latency-budget blowouts on the sync path.
+
+    Set 'slow' on UDFs that wrap expensive LLM inference, ML model serving with
+    cold-start risk, multi-stage gRPC fanout, or any external service with a tail
+    latency over the sync action wall-clock budget."""
+
     def __init__(self, validation_context: 'ValidationContext', arguments: Arguments):
         self._rvalue_type_checker: Optional[RValueTypeChecker] = None
 

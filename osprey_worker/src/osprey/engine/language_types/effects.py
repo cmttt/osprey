@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import Generic, Iterable, List, Self
+from typing import ClassVar, Generic, Iterable, List, Self
 
 from osprey.engine.executor.custom_extracted_features import (
     CustomExtractedFeature,
@@ -29,6 +29,20 @@ class EffectBase:
     - :class:`osprey_engine.packages.osprey_language_types.labels.LabelEffect`
       - Used in :class:`osprey_engine.packages.osprey_stdlib.udfs.labels.LabelAdd` and :class:`osprey_engine.packages.osprey_stdlib.udfs.labels.LabelRemove`
     """
+
+    mutates_state: ClassVar[bool] = False
+    """True if this effect type writes to persistent state (label store, classification
+    record, Safety Signal pubsub, intervention queue, etc.). Used by the Phase 3
+    tier-constraint validator to forbid state-mutating effects in tier='both' WhenRules
+    (where they would emit on both sync and async paths, causing duplicate writes).
+
+    Set True on:
+    - LabelEffect / RemoveLabelEffect / LabelEffectWithExpiry
+    - ClassificationEffect (Safety Record write)
+    - SignalEffect (Safety Signal pubsub)
+    - Any future effect that fans out to persistent storage or downstream consumers.
+
+    Verdict effects keep this False — verdicts are a response channel, not state."""
 
     rules: List[RuleT] = field(default_factory=list)
     """
