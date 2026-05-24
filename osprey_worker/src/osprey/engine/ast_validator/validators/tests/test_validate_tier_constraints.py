@@ -242,3 +242,29 @@ def test_mutating_effect_via_name_reference_in_both_fails(run_validation: RunVal
     rendered = exc_info.value.rendered()
     assert "FakeMutatingUDF" in rendered
     assert "tier=`both`" in rendered
+
+
+def test_mutating_udf_in_rules_any_fails_for_both(run_validation: RunValidationFunction) -> None:
+    """State-mutating UDFs (like Count(increment_if=True) or SendIpFraudRequest)
+    can appear in rules_any chains, not just in then=[...]. tier='both' must
+    catch them via the rules_any walk too — otherwise they'd double-fire across
+    sync and async paths.
+
+    Models the production pattern:
+        SomeCounter: int = SideEffectingCount(...)  # increments state
+        SomeRule = Rule(when_all=[SomeCounter > 5])
+        WhenRules(rules_any=[SomeRule], ..., tier="both")  # ← would double-increment
+    """
+    with pytest.raises(ValidationFailed) as exc_info:
+        run_validation("""
+            Counter: EffectBase = FakeMutatingUDF()
+            CounterRule = Rule(when_all=[Counter != Counter], description="trivial")
+            WhenRules(
+                rules_any=[CounterRule],
+                then=[DeclareVerdict(verdict="info")],
+                tier="both",
+            )
+        """)
+    rendered = exc_info.value.rendered()
+    assert "FakeMutatingUDF" in rendered
+    assert "tier=`both`" in rendered

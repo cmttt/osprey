@@ -79,33 +79,38 @@ class ValidateTierConstraints(SourceValidator):
                     ),
                 )
 
-        # Constraint 2: state-mutating effects forbidden in tier=both.
-        # Follow Name references the same way `_collect_slow_udfs` does, so
-        # `then=[HelperEffect]` where HelperEffect = LabelAdd(...) still trips
-        # the check.
+        # Constraint 2: state-mutating UDFs forbidden in tier=both.
+        # Walk BOTH `then` and `rules_any`:
+        #   - `then=[LabelAdd(...)]` — UDF returns an Effect, classic case.
+        #   - `then=[Helper]` where `Helper = LabelAdd(...)` — caught via Name resolution.
+        #   - `rules_any=[CounterTooHigh]` where `CounterTooHigh = Count(...) > 5`
+        #     — `Count` mutates a counter even though it's in rules_any, not then.
+        #   - `then=[Effect(arg=SomeSideEffectingUDF(...))]` — nested side effect.
+        # We recurse into Call args here so side effects in nested positions are caught.
         if tier == "both":
-            then_kw = call.find_argument("then")
-            if then_kw is not None:
-                mutating_hits: List[Tuple[str, object]] = []
-                seen_mut: Set[int] = set()
-                self._collect_matching_udfs(
-                    then_kw.value, name_to_assign, mutating_hits, seen_mut,
-                    predicate=lambda cls: getattr(cls, "mutates_state", False),
-                    recurse_into_call_args=False,
-                )
-                for udf_name, span in mutating_hits:
-                    self.context.add_error(
-                        message=f"tier=`both` WhenRules emits state-mutating effect `{udf_name}`",
-                        span=span,  # type: ignore[arg-type]
-                        hint=(
-                            f"`{udf_name}` is declared mutates_state=True; "
-                            "in tier=`both` WhenRules it would emit on both sync and async paths, "
-                            "causing duplicate writes\n"
-                            "pick a single tier:\n"
-                            "  - tier=`sync` if the effect should fire in-line with the API request, or\n"
-                            "  - tier=`async` if the effect should fire on the async post-processing pass"
-                        ),
+            mutating_hits: List[Tuple[str, object]] = []
+            seen_mut: Set[int] = set()
+            for kwarg_name in ("then", "rules_any"):
+                kw = call.find_argument(kwarg_name)
+                if kw is not None:
+                    self._collect_matching_udfs(
+                        kw.value, name_to_assign, mutating_hits, seen_mut,
+                        predicate=lambda cls: getattr(cls, "mutates_state", False),
+                        recurse_into_call_args=True,
                     )
+            for udf_name, span in mutating_hits:
+                self.context.add_error(
+                    message=f"tier=`both` WhenRules emits state-mutating UDF `{udf_name}`",
+                    span=span,  # type: ignore[arg-type]
+                    hint=(
+                        f"`{udf_name}` is declared mutates_state=True; "
+                        "in tier=`both` WhenRules it would emit on both sync and async paths, "
+                        "causing duplicate writes\n"
+                        "pick a single tier:\n"
+                        "  - tier=`sync` if the effect should fire in-line with the API request, or\n"
+                        "  - tier=`async` if the effect should fire on the async post-processing pass"
+                    ),
+                )
 
     # ------------------------------------------------------------------
     # Constraint walkers
