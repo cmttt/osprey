@@ -427,6 +427,13 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
             if not osprey_coordinator_action.action_name:
                 raise ValueError('action name must never be empty')
 
+            execution_mode = _proto_mode_to_str(osprey_coordinator_action.mode)
+            logger.info(
+                'received osprey action: action_id=%s action_name=%s execution_mode=%s',
+                osprey_coordinator_action.action_id,
+                osprey_coordinator_action.action_name,
+                execution_mode,
+            )
             return OspreyEngineAction(
                 action_id=osprey_coordinator_action.action_id,
                 action_name=osprey_coordinator_action.action_name,
@@ -434,7 +441,7 @@ class OspreyCoordinatorInputStream(AsyncBaseInputStream[BaseAckingContext[Osprey
                 secret_data=secret_data,
                 timestamp=osprey_coordinator_action.timestamp.ToDatetime(tzinfo=pytz.utc),
                 encoding=encoding,
-                execution_mode=_proto_mode_to_str(osprey_coordinator_action.mode),
+                execution_mode=execution_mode,
             )
         except Exception:
             logger.exception('Error while generating input message')
