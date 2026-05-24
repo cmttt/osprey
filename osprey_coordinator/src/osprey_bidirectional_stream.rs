@@ -436,3 +436,80 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod execution_mode_tests {
+    use crate::proto::ExecutionMode;
+    use crate::proto::OspreyCoordinatorAction;
+    use prost::Message;
+
+    /// An older binary that doesn't know about field 8 encodes a message without `mode`.
+    /// When decoded by a newer worker, the field must default to UNSPECIFIED so no tier
+    /// filtering applies — preserving today's behavior.
+    #[test]
+    fn old_message_without_mode_decodes_as_unspecified() {
+        let old_msg = OspreyCoordinatorAction {
+            ack_id: 42,
+            action_id: 100,
+            action_name: "USER_REGISTER_ATTEMPTED".to_string(),
+            action_data: None,
+            secret_data: None,
+            timestamp: None,
+            mode: 0, // explicit default — simulates an old binary that doesn't set mode
+        };
+        let mut encoded = Vec::new();
+        old_msg.encode(&mut encoded).unwrap();
+
+        let decoded = OspreyCoordinatorAction::decode(&encoded[..]).unwrap();
+
+        assert_eq!(decoded.mode, ExecutionMode::Unspecified as i32);
+        assert_eq!(decoded.action_name, "USER_REGISTER_ATTEMPTED");
+        assert_eq!(decoded.ack_id, 42);
+        assert_eq!(decoded.action_id, 100);
+    }
+
+    #[test]
+    fn message_with_sync_mode_round_trips() {
+        let msg = OspreyCoordinatorAction {
+            ack_id: 1,
+            action_id: 2,
+            action_name: "GUILD_JOIN_ATTEMPTED".to_string(),
+            action_data: None,
+            secret_data: None,
+            timestamp: None,
+            mode: ExecutionMode::Sync as i32,
+        };
+        let mut encoded = Vec::new();
+        msg.encode(&mut encoded).unwrap();
+        let decoded = OspreyCoordinatorAction::decode(&encoded[..]).unwrap();
+        assert_eq!(decoded.mode, ExecutionMode::Sync as i32);
+        assert_eq!(decoded.action_name, "GUILD_JOIN_ATTEMPTED");
+    }
+
+    #[test]
+    fn message_with_async_mode_round_trips() {
+        let msg = OspreyCoordinatorAction {
+            ack_id: 1,
+            action_id: 2,
+            action_name: "GUILD_JOINED".to_string(),
+            action_data: None,
+            secret_data: None,
+            timestamp: None,
+            mode: ExecutionMode::Async as i32,
+        };
+        let mut encoded = Vec::new();
+        msg.encode(&mut encoded).unwrap();
+        let decoded = OspreyCoordinatorAction::decode(&encoded[..]).unwrap();
+        assert_eq!(decoded.mode, ExecutionMode::Async as i32);
+    }
+
+    /// Sanity: proto3 enums default to 0 when constructed via Default.
+    /// Confirms the back-compat contract for any code path that constructs
+    /// OspreyCoordinatorAction without explicitly setting mode.
+    #[test]
+    fn default_mode_is_unspecified() {
+        let msg = OspreyCoordinatorAction::default();
+        assert_eq!(msg.mode, ExecutionMode::Unspecified as i32);
+        assert_eq!(msg.mode, 0);
+    }
+}
