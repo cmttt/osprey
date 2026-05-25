@@ -137,6 +137,11 @@ class OspreyEngine:
                 f'Failed to compile execution graph for sources={self._sources_provider.get_current_sources().hash()}'
             )
         else:
+            # Clear stale specialized graphs — they reference the old full_graph.
+            # Must happen before any other side effects so a concurrent execute()
+            # call sees a consistent view: either the old graph or the new one,
+            # never a specialized graph backed by the replaced full graph.
+            self._specialized_graphs.clear()
             # Only do this if no exception occurred above
             self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
             # Confirm to the provider which sources are now live so it dedups no-op

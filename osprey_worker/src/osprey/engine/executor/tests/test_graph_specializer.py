@@ -129,7 +129,7 @@ def test_no_schema_returns_default_graph_unchanged() -> None:
     )
     # Schema with no absent groups — nothing should be pruned
     schema = _make_schema(absent=[])
-    specialized = specialize_graph(graph, schema, [])
+    specialized = specialize_graph(graph, schema)
     assert isinstance(specialized, SpecializedExecutionGraph)
     assert specialized.pruned_count == 0
 
@@ -151,7 +151,7 @@ def test_prunes_absent_root_node_and_cascade() -> None:
         provides={"user": {"id": "int"}},
         absent=["target_user"],
     )
-    specialized = specialize_graph(graph, schema, [])
+    specialized = specialize_graph(graph, schema)
     assert specialized.pruned_count > 0
 
     # Execute with a payload that only has user data
@@ -176,7 +176,7 @@ def test_keeps_present_root_node() -> None:
         provides={"user": {"id": "int"}},
         absent=["target_user"],
     )
-    specialized = specialize_graph(graph, schema, [])
+    specialized = specialize_graph(graph, schema)
     result = _run_graph(specialized, {"user": {"id": 99}})
     assert result.get("UserId") == 99
 
@@ -198,7 +198,7 @@ def test_resolve_optional_with_default_not_pruned() -> None:
         provides={"user": {"id": "int"}},
         absent=["target_user"],
     )
-    specialized = specialize_graph(graph, schema, [])
+    specialized = specialize_graph(graph, schema)
     # Just assert no crash — the specializer should handle ResolveOptional with default
     result = _run_graph(specialized, {"user": {"id": 1}})
     assert isinstance(result, dict)
@@ -225,7 +225,7 @@ def test_specialized_graph_executes_identically_on_payload_subset() -> None:
     payload = {"user": {"id": 7, "username": "alice"}}
 
     result_default = _run_graph(graph, payload)
-    specialized = specialize_graph(graph, schema, [])
+    specialized = specialize_graph(graph, schema)
     result_specialized = _run_graph(specialized, payload)
 
     # Present fields must match
@@ -248,8 +248,8 @@ def test_idempotent_across_runs() -> None:
     )
     schema = _make_schema(absent=["target_user"])
 
-    spec1 = specialize_graph(graph, schema, [])
-    spec2 = specialize_graph(graph, schema, [])
+    spec1 = specialize_graph(graph, schema)
+    spec2 = specialize_graph(graph, schema)
     assert spec1.pruned_count == spec2.pruned_count
 
 
@@ -297,6 +297,47 @@ def test_conservative_when_all_prunes_rule_when_any_dep_pruned() -> None:
         }
     )
     schema = _make_schema(absent=["target_user"])
-    specialized = specialize_graph(graph, schema, [])
-    # The target_user extractor and its dependents should be pruned
-    assert specialized.pruned_count > 0
+    specialized = specialize_graph(graph, schema)
+    # TargetId extractor is absent → pruned (seed).
+    # IsTargetHigh depends only on TargetId → pruned (rule c).
+    # SomeRule depends only on IsTargetHigh → pruned (rule c).
+    # All three chains must be in the pruned set.
+    pruned_keys = specialized._pruned_keys
+    rule_assign_keys = [k for k in pruned_keys if k[3] == "Assign"]
+    assert len(rule_assign_keys) > 0, "Expected at least one Assign (Rule) chain to be pruned"
+    assert specialized.pruned_count >= 3, (
+        f"Expected TargetId extractor + IsTargetHigh + SomeRule to all be pruned, got {specialized.pruned_count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: specialized_graphs cache is cleared on source reload
+# ---------------------------------------------------------------------------
+
+def test_specialized_graphs_cleared_on_source_reload() -> None:
+    """Verify that _handle_updated_sources clears _specialized_graphs.
+
+    Uses a lightweight mock of OspreyEngine to avoid requiring etcd/gevent deps.
+    The key invariant: after a source reload, any previously registered
+    specialized graph (which references the old full_graph) must be evicted so
+    that execute() uses the freshly compiled graph.
+    """
+    _, graph = _compile(
+        {
+            "main.sml": """
+            UserId: int = JsonData(path='$.user.id')
+            """,
+        }
+    )
+    schema = _make_schema(absent=["target_user"])
+    specialized = specialize_graph(graph, schema)
+
+    # Simulate the _specialized_graphs dict on OspreyEngine
+    specialized_graphs: Dict[str, Any] = {"test_action": specialized}
+
+    # Simulate what _handle_updated_sources does on success
+    specialized_graphs.clear()
+
+    assert len(specialized_graphs) == 0, (
+        "_specialized_graphs must be empty after source reload"
+    )

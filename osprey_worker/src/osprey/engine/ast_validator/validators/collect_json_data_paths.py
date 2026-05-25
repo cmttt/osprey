@@ -9,6 +9,8 @@ where action_name is derived from `actions/<name>.sml` paths.
 from __future__ import annotations
 
 import logging
+import os
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
@@ -19,6 +21,15 @@ from osprey.engine.ast.grammar import Assign, Call, Name, Source, Span
 from osprey.engine.ast_validator.base_validator import BaseValidator, HasResult
 from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
+from osprey.engine.schema.schema_loader import load_schema_for_action
+from osprey.engine.stdlib.udfs.require import Require
+
+try:
+    import jsonpath_rw
+    import jsonpath_rw.jsonpath as _jp
+    _HAS_JSONPATH_RW = True
+except ImportError:
+    _HAS_JSONPATH_RW = False
 
 if TYPE_CHECKING:
     from osprey.engine.ast_validator.validation_context import ValidationContext
@@ -90,22 +101,20 @@ def _extract_top_level_group(path_str: str) -> str:
         if rest:
             return rest.split(".")[0].split("[")[0]
     # Fallback: use jsonpath_rw for non-trivial paths
-    try:
-        from jsonpath_rw import parse
-        import jsonpath_rw.jsonpath as jp
-
-        parsed = parse(path_str)
-        cur = parsed
-        while hasattr(cur, "left"):
-            if isinstance(cur.left, jp.Root):
-                return str(cur.right)
-            if hasattr(cur.left, "left") and isinstance(cur.left.left, jp.Root):
-                return str(cur.left.right)
-            cur = cur.left
-        if hasattr(cur, "fields"):
-            return cur.fields[0]
-    except Exception:
-        pass
+    if _HAS_JSONPATH_RW:
+        try:
+            parsed = jsonpath_rw.parse(path_str)
+            cur = parsed
+            while hasattr(cur, "left"):
+                if isinstance(cur.left, _jp.Root):
+                    return str(cur.right)
+                if hasattr(cur.left, "left") and isinstance(cur.left.left, _jp.Root):
+                    return str(cur.left.right)
+                cur = cur.left
+            if hasattr(cur, "fields"):
+                return cur.fields[0]
+        except Exception:
+            log.debug("jsonpath_rw failed to parse %r, falling back to string split", path_str)
     return path_str.lstrip("$").lstrip(".").split(".")[0]
 
 
@@ -173,11 +182,11 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
     def _reachable_sources(self, action_source: Source) -> List[Source]:
         """BFS from action_source following both Import (static) and Require edges."""
         visited: Set[str] = set()
-        queue: List[Source] = [action_source]
+        queue: deque[Source] = deque([action_source])
         result: List[Source] = []
 
         while queue:
-            src = queue.pop(0)
+            src = queue.popleft()
             if src.path in visited:
                 continue
             visited.add(src.path)
@@ -201,8 +210,6 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
         Both literal string and format-string (glob) forms are resolved.
         require_if is NOT inspected — both branches are walked statically.
         """
-        from osprey.engine.stdlib.udfs.require import Require
-
         targets: List[Source] = []
         for call_node in filter_nodes(source.ast_root, Call):
             if id(call_node) not in self._udf_node_mapping:
@@ -248,7 +255,7 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
             if path_const is not None and hasattr(path_const, "value"):
                 path_str = path_const.value
         except Exception:
-            pass
+            log.debug("Failed to read 'path' argument from %r", call_node)
 
         if path_str is None:
             return None
@@ -262,7 +269,7 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
                 if isinstance(req_ast, grammar.Boolean):
                     required = req_ast.value
         except Exception:
-            pass
+            log.debug("Failed to read 'required' argument from %r", call_node)
 
         try:
             if hasattr(arguments, "has_argument_ast") and arguments.has_argument_ast("coerce_type"):
@@ -270,7 +277,7 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
                 if isinstance(coerce_ast, grammar.Boolean):
                     coerce_type = coerce_ast.value
         except Exception:
-            pass
+            log.debug("Failed to read 'coerce_type' argument from %r", call_node)
 
         top_level_group = _extract_top_level_group(path_str)
 
@@ -301,13 +308,9 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
         Returns None if no schema directory is configured or no schema exists.
         This is called from _cross_check_types().
         """
-        import os
-
         schemas_dir_str = os.environ.get("OSPREY_SCHEMAS_DIR", "")
         if not schemas_dir_str:
             return None
-
-        from osprey.engine.schema.schema_loader import load_schema_for_action
 
         schemas_dir = Path(schemas_dir_str)
         return load_schema_for_action(action_name, schemas_dir)
@@ -335,7 +338,6 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
                     if source is None:
                         continue
                     # Build a minimal Span pointing at the call's line/col
-                    from osprey.engine.ast.grammar import Span
                     span = Span(
                         source=source,
                         start_line=field.span_start_line,
