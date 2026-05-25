@@ -122,6 +122,23 @@ class TestSchemaLoader:
         assert isinstance(schema.absent_groups, frozenset)
         assert isinstance(schema.provides_groups, frozenset)
 
+    def test_ref_path_traversal_relative_escapes(self, tmp_path: Path) -> None:
+        """$ref with relative traversal (../../etc/passwd) must raise SchemaLoadError."""
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:../../etc/passwd"}
+        path = _write_schema(tmp_path, schema_data)
+        with pytest.raises(SchemaLoadError, match="escapes schemas directory"):
+            load_schema(path, schemas_dir=tmp_path)
+
+    def test_ref_path_traversal_absolute_injection(self, tmp_path: Path) -> None:
+        """$ref with an absolute path should not escape schemas_dir."""
+        # An absolute path injected via $ref: /tmp/secret would resolve outside schemas_dir
+        schema_data = dict(_VALID_SCHEMA)
+        schema_data["provides"] = {"user": "$ref:/etc/hostname"}
+        path = _write_schema(tmp_path, schema_data)
+        with pytest.raises(SchemaLoadError, match="escapes schemas directory"):
+            load_schema(path, schemas_dir=tmp_path)
+
     def test_schema_with_no_provides_and_no_absent(self, tmp_path: Path) -> None:
         minimal = {
             "$schema": "https://discord.dev/smite/action-schema/v1",

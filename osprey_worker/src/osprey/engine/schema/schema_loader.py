@@ -7,7 +7,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, FrozenSet, List, Optional, Set
 
 log = logging.getLogger(__name__)
 
@@ -19,8 +19,8 @@ class ActionSchema:
     """Parsed representation of a per-action schema JSON file."""
 
     action: str
-    provides_groups: Set[str]       # keys of `provides`
-    absent_groups: Set[str]         # from `absent`
+    provides_groups: FrozenSet[str]       # keys of `provides`
+    absent_groups: FrozenSet[str]         # from `absent`
     provides_field_types: Dict[str, str]   # "user.id" -> "int" (dot-notation, flattened)
     optional_for: Dict[str, List[str]]
 
@@ -81,10 +81,22 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
 
     # Resolve $ref: references — load referenced type files and merge into provides
     # $ref values point to types/<name>.json relative to schemas_dir
+    _schemas_dir_resolved = schemas_dir.resolve()
+
+    def _resolve_ref_path(ref_str: str) -> Path:
+        """Resolve a $ref: path and assert it stays within schemas_dir."""
+        ref_rel = ref_str[len("$ref:"):]
+        ref_path = (schemas_dir / ref_rel).resolve()
+        if not ref_path.is_relative_to(_schemas_dir_resolved):
+            raise SchemaLoadError(
+                f"$ref path escapes schemas directory: {ref_rel!r} resolves to {ref_path}"
+            )
+        return ref_path
+
     resolved_provides: Dict[str, object] = {}
     for group, value in raw_provides.items():
         if isinstance(value, str) and value.startswith("$ref:"):
-            ref_path = schemas_dir / value[len("$ref:"):]
+            ref_path = _resolve_ref_path(value)
             try:
                 ref_data = json.loads(ref_path.read_text())
             except FileNotFoundError:
@@ -98,11 +110,13 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
     # Also resolve top-level $ref entries in types_used if they provide field definitions
     for group, ref_str in types_used.items():
         if isinstance(ref_str, str) and ref_str.startswith("$ref:") and group not in resolved_provides:
-            ref_path = schemas_dir / ref_str[len("$ref:"):]
             try:
+                ref_path = _resolve_ref_path(ref_str)
                 ref_data = json.loads(ref_path.read_text())
                 resolved_provides[group] = ref_data
                 provides_groups.add(group)
+            except SchemaLoadError:
+                raise
             except (FileNotFoundError, json.JSONDecodeError):
                 # types_used refs are informational; skip if the file doesn't exist yet
                 pass

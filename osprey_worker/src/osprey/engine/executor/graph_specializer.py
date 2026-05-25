@@ -11,11 +11,11 @@ Pruning rules (per §4.4 of the typed-action-contracts plan):
      `extracts_json_path = True` AND whose path top-level group is in
      schema.absent_groups is pruned.
   2. Propagation:
-     (a) Conservative Rule: prune if ANY when_all dep is pruned.
-     (b) ResolveOptional with non-None default_value: rewrite to a
-         short-circuit (return default without evaluating optional_value).
-         Implemented by filtering the optional_value dep from the chain.
-     (c) Default propagation: prune if ALL non-constant deps are pruned.
+     (b) ResolveOptional with non-None default_value: rescued — not pruned
+         even if its optional_value dep is pruned (returns default at runtime).
+     (c) Default propagation: prune if ALL non-constant (non-IsConstant) deps
+         are pruned. Literal constants (String, Number, Boolean) do not block
+         pruning of their parent, since they are always computable.
   3. Surviving chains are assembled into a SpecializedExecutionGraph.
 
 Stable node identity: NodeKey = Tuple[str, int, int, str]
@@ -26,12 +26,16 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
-from osprey.engine.ast.grammar import ASTNode, Source
+from osprey.engine.ast.grammar import IsConstant, Source
+from osprey.engine.ast.grammar import List as GrammarList
+from osprey.engine.ast.grammar import String
 from osprey.engine.executor.dependency_chain import DependencyChain
 from osprey.engine.executor.execution_graph import ExecutionGraph
+from osprey.engine.executor.node_executor.call_executor import CallExecutor
+from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
+from osprey.engine.stdlib.udfs.rules import Rule
 
 if TYPE_CHECKING:
-    from osprey.engine.ast_validator.validation_context import ValidatedSources
     from osprey.engine.ast_validator.validators.collect_json_data_paths import FieldDeclaration
     from osprey.engine.schema.schema_loader import ActionSchema
 
@@ -50,8 +54,6 @@ def _node_key_from_chain(chain: DependencyChain) -> NodeKey:
 
 def _chain_udf(chain: DependencyChain) -> Optional[object]:
     """Return the UDF instance from a CallExecutor chain, or None."""
-    from osprey.engine.executor.node_executor.call_executor import CallExecutor
-
     if isinstance(chain.executor, CallExecutor):
         return chain.executor._udf
     return None
@@ -72,14 +74,10 @@ def _get_extractor_path(chain: DependencyChain) -> Optional[str]:
         return None
     # Path is stored on the UDF's arguments (already resolved ConstExpr)
     # Access via the executor's unresolved_arguments
-    from osprey.engine.executor.node_executor.call_executor import CallExecutor
-
     if isinstance(chain.executor, CallExecutor):
         try:
             path_arg = chain.executor.unresolved_arguments.get_argument_ast("path")
             if path_arg is not None:
-                from osprey.engine.ast.grammar import String
-
                 if isinstance(path_arg, String):
                     return path_arg.value
         except Exception:
@@ -98,16 +96,12 @@ def _get_top_level_group(path_str: str) -> str:
 
 def _is_resolve_optional_chain(chain: DependencyChain) -> bool:
     """Return True if this chain's UDF is ResolveOptional."""
-    from osprey.engine.stdlib.udfs.resolve_optional import ResolveOptional
-
     udf = _chain_udf(chain)
     return isinstance(udf, ResolveOptional)
 
 
 def _resolve_optional_has_default(chain: DependencyChain) -> bool:
     """Return True if this ResolveOptional has a non-None default_value."""
-    from osprey.engine.executor.node_executor.call_executor import CallExecutor
-
     if not isinstance(chain.executor, CallExecutor):
         return False
     try:
@@ -119,17 +113,12 @@ def _resolve_optional_has_default(chain: DependencyChain) -> bool:
 
 def _is_rule_chain(chain: DependencyChain) -> bool:
     """Return True if this chain's UDF is a Rule (which has when_all)."""
-    from osprey.engine.stdlib.udfs.rules import Rule
-
     udf = _chain_udf(chain)
     return isinstance(udf, Rule)
 
 
 def _get_when_all_dep_keys(chain: DependencyChain) -> List[NodeKey]:
     """Return node keys for the when_all argument dependencies of a Rule chain."""
-    from osprey.engine.executor.node_executor.call_executor import CallExecutor
-    from osprey.engine.ast.grammar import List as GrammarList
-
     if not isinstance(chain.executor, CallExecutor):
         return []
     try:
@@ -187,7 +176,6 @@ def _collect_all_chains_recursive(chains: Sequence[DependencyChain]) -> List[Dep
 def specialize_graph(
     full_graph: ExecutionGraph,
     schema: "ActionSchema",
-    manifest_fields: List["FieldDeclaration"],
 ) -> "SpecializedExecutionGraph":
     """Produce a specialized execution graph for the given action schema.
 
@@ -197,7 +185,6 @@ def specialize_graph(
     Returns a SpecializedExecutionGraph that delegates to full_graph for
     everything except pruned chains.
     """
-    # Build lookup: NodeKey -> FieldDeclaration for fast absent-check
     absent_groups: FrozenSet[str] = schema.absent_groups
 
     # Step 1 — collect all chains and build key maps
@@ -222,6 +209,14 @@ def specialize_graph(
                     pruned.add(_node_key_from_chain(chain))
 
     # Step 3 — propagation loop
+    #
+    # Rule (a) — conservative when_all pruning — is intentionally omitted.
+    # It was designed to prune Rule nodes when any when_all dep is pruned, but
+    # _get_when_all_dep_keys builds keys from raw GrammarList items (Name AST
+    # nodes) while `pruned` is keyed on Assign-chain nodes. The mismatch means
+    # rule (a) never matched anything and its effect was already covered by
+    # rule (c), which correctly propagates via chain.dependent_on. Removing it
+    # simplifies the code without changing observed behavior.
     changed = True
     while changed:
         changed = False
@@ -232,38 +227,46 @@ def specialize_graph(
 
             deps = chain.dependent_on
 
-            # (a) Conservative WhenRules: prune if ANY when_all dep is pruned
-            if _is_rule_chain(chain):
-                when_all_keys = _get_when_all_dep_keys(chain)
-                if when_all_keys and any(k in pruned for k in when_all_keys):
-                    pruned.add(key)
-                    changed = True
-                    continue
-
             # (b) ResolveOptional with default: don't prune even if optional_value dep
             # is pruned — the node will return default_value at runtime.
             # Rescue all transitive pruned deps so the executor can find them at runtime.
+            # `rescued` prevents re-visiting nodes in diamond-shaped dependency graphs.
             if _is_resolve_optional_chain(chain) and _resolve_optional_has_default(chain):
-                # Walk all deps (and their transitive deps) — if any were pruned, rescue
-                # them so the chain can still execute (producing None for absent fields).
                 to_rescue: List[DependencyChain] = list(deps)
+                rescued: Set[NodeKey] = set()
                 while to_rescue:
                     dep = to_rescue.pop()
                     dep_key = _node_key_from_chain(dep)
+                    if dep_key in rescued:
+                        continue
+                    rescued.add(dep_key)
                     if dep_key in pruned:
                         pruned.discard(dep_key)
                         changed = True
                         to_rescue.extend(dep.dependent_on)
                 continue
 
-            # (c) Default propagation: prune if ALL non-constant deps are pruned
-            non_const_dep_keys = []
+            # (c) Default propagation: prune if ALL non-constant deps are pruned.
+            # A dep whose AST node is an IsConstant (String, Number, Boolean,
+            # etc.) can never be pruned and should not block pruning of its
+            # parent.  A dep that is NOT a constant but is not yet in `pruned`
+            # is a live computed value that keeps the current chain alive.
+            non_const_surviving_dep_keys = []
             for dep in deps:
+                if isinstance(dep.executor.node, IsConstant) and dep.executor.node.is_constant:
+                    # Literal constant — skip; cannot be pruned
+                    continue
                 dep_key = _node_key_from_chain(dep)
                 if dep_key not in pruned:
-                    non_const_dep_keys.append(dep_key)
+                    non_const_surviving_dep_keys.append(dep_key)
 
-            if deps and not non_const_dep_keys:
+            # Only prune if there is at least one non-constant dep (otherwise
+            # the chain itself is effectively constant and should remain).
+            has_non_const_dep = any(
+                not (isinstance(dep.executor.node, IsConstant) and dep.executor.node.is_constant)
+                for dep in deps
+            )
+            if has_non_const_dep and not non_const_surviving_dep_keys:
                 pruned.add(key)
                 changed = True
 
