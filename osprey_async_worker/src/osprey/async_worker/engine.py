@@ -40,6 +40,7 @@ from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execu
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
+from osprey.worker.lib.instruments import metrics
 from osprey.worker.lib.sources_config import get_config_registry
 from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
 
@@ -160,11 +161,14 @@ class AsyncOspreyEngine:
         so the loop stays free during compile and in-flight gRPC tasks can
         drain and release their pinned response buffers.
         """
+        desired_hash = self._sources_provider.get_current_sources().hash()
         try:
             new_graph = await self.compile_execution_graph()
         except Exception:
-            log.exception(
-                f'Failed to compile execution graph for sources={self._sources_provider.get_current_sources().hash()}'
+            log.exception(f'Failed to compile execution graph for sources={desired_hash}')
+            metrics.increment(
+                'osprey.rules_compile_failed',
+                tags=[f'desired:{desired_hash[:16]}'],
             )
             return
 
@@ -185,11 +189,11 @@ class AsyncOspreyEngine:
         # rule recompiles the resulting GC pressure raises per-message CPU.
         #
         # Fix: after the swap, walk the OLD graph's AST and null `parent`
-        # pointers. That breaks the cycle so plain refcount reclaims the
-        # old graph as in-flight references drop. Parent pointers are
-        # consumed only by validators (compile-time) — the executor never
-        # reads them — so nulling them on the about-to-be-discarded graph
-        # is safe for in-flight tasks.
+        # pointers — but ONLY on sources whose ast_root is not shared with the
+        # NEW graph. `parsed_ast_root_cache` in osprey/engine/ast/grammar.py
+        # memoizes ast_root by Source content, so unchanged source files share
+        # the same ast_root between graphs. Nulling parents on shared nodes
+        # would corrupt the new graph's AST.
         old_graph = self._execution_graph
         self._execution_graph = new_graph
 
@@ -202,19 +206,26 @@ class AsyncOspreyEngine:
             except Exception:
                 log.exception('Failed to export validation results')
 
-        self._break_old_graph_cycles(old_graph)
+        self._break_old_graph_cycles(old_graph, new_graph)
 
     @staticmethod
-    def _break_old_graph_cycles(old_graph: ExecutionGraph) -> None:
+    def _break_old_graph_cycles(old_graph: ExecutionGraph, new_graph: ExecutionGraph) -> None:
         """Null `parent` back-pointers on every AST node in the discarded graph
         so plain refcount can reclaim it without waiting for gen-2 GC.
+
+        Skips any source whose ast_root is shared with the new graph — those
+        come from the module-level ``parsed_ast_root_cache`` and mutating them
+        would corrupt the new graph the engine just swapped in.
 
         Best-effort: any exception here is logged and swallowed. A leaked old
         graph is wasteful but not incorrect.
         """
         try:
+            new_root_ids = {id(s.ast_root) for s in new_graph.validated_sources.sources}
             count = 0
             for source in old_graph.validated_sources.sources:
+                if id(source.ast_root) in new_root_ids:
+                    continue
                 for node in iter_nodes(source.ast_root):
                     node.parent = None
                     count += 1
