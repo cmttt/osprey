@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
@@ -29,7 +30,9 @@ from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, Mode
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.executor import execute
+from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
+from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
@@ -95,6 +98,7 @@ class OspreyEngine:
         # Specialized graphs for typed action contracts (§4.5 runtime dispatch)
         # Maps action_name -> SpecializedExecutionGraph. Populated via register_specialized_graph().
         self._specialized_graphs: Dict[str, ExecutionGraph] = {}
+        self._load_and_register_schemas()
 
     def _compile_execution_graph(self, disable_periodic_yield: bool = False) -> ExecutionGraph:
         def _do_compile_execution_graph() -> ExecutionGraph:
@@ -127,6 +131,36 @@ class OspreyEngine:
 
         return self._execution_graph_compilation_thread_pool.apply(_do_compile_execution_graph)
 
+    def _load_and_register_schemas(self) -> None:
+        """Read schemas from $OSPREY_SCHEMAS_DIR and register specialized graphs.
+
+        Called after every compilation (init + reload). No-op if env var unset
+        or directory empty/missing.
+        """
+        schemas_dir_str = os.environ.get("OSPREY_SCHEMAS_DIR", "")
+        if not schemas_dir_str:
+            return
+        schemas_dir = Path(schemas_dir_str)
+        if not schemas_dir.is_dir():
+            log.warning("OSPREY_SCHEMAS_DIR=%r is not a directory; skipping schema load", schemas_dir_str)
+            return
+
+        action_names = self.get_known_action_names()
+        loaded = 0
+        for action_name in action_names:
+            try:
+                schema = load_schema_for_action(action_name, schemas_dir)
+            except SchemaLoadError as e:
+                log.warning("Failed to load schema for %s: %s", action_name, e)
+                continue
+            if schema is None:
+                continue
+            specialized = specialize_graph(self._execution_graph, schema)
+            self.register_specialized_graph(action_name, specialized)
+            loaded += 1
+        if loaded:
+            log.info("Loaded %d specialized graphs from %s", loaded, schemas_dir)
+
     def _handle_updated_sources(self) -> None:
         # noinspection PyBroadException
         try:
@@ -142,6 +176,8 @@ class OspreyEngine:
             # call sees a consistent view: either the old graph or the new one,
             # never a specialized graph backed by the replaced full graph.
             self._specialized_graphs.clear()
+            # Reload schemas for the new graph.
+            self._load_and_register_schemas()
             # Only do this if no exception occurred above
             self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
             # Confirm to the provider which sources are now live so it dedups no-op
