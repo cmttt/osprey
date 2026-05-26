@@ -1,6 +1,10 @@
 """Tests for CollectJsonDataPaths validator (§4.2 / §5.3)."""
 from __future__ import annotations
 
+import json
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Callable, List
 
 import pytest
@@ -342,3 +346,145 @@ def test_collects_all_three_extract_udfs(run_validation: RunValidationFunction) 
     udf_names = {f.udf_name for f in fields}
     assert "JsonData" in udf_names
     assert "EntityJson" in udf_names
+
+
+# ---------------------------------------------------------------------------
+# Helpers for cross-check warning tests (Issues §4.6 Check 1 and Check 3)
+# ---------------------------------------------------------------------------
+
+_VALID_SCHEMA_BASE = {
+    "$schema": "https://discord.dev/smite/action-schema/v1",
+    "version": 1,
+    "generated_from": {"source": "test", "date": "2026-05-25", "authored_by": "test"},
+    "types_used": {},
+    "optional_for": {},
+}
+
+
+def _write_schema(tmp_path: Path, action: str, provides: dict, absent: list) -> Path:
+    schema = dict(_VALID_SCHEMA_BASE)
+    schema["action"] = action
+    schema["provides"] = provides
+    schema["absent"] = absent
+    schema_path = tmp_path / f"{action}.json"
+    schema_path.write_text(json.dumps(schema))
+    return schema_path
+
+
+def _get_warnings(run_validation: RunValidationFunction, sources_dict: Any) -> List[Any]:
+    validated = run_validation(sources_dict)
+    return list(validated.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Test: Check 1 — absent-field usage emits a warning
+# ---------------------------------------------------------------------------
+
+def test_cross_check_absent_field_emits_warning(run_validation: RunValidationFunction) -> None:
+    """Check 1: a rule that extracts a path from an absent group should emit a warning."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _write_schema(
+            Path(tmp_dir),
+            action="test_action",
+            provides={"user": {"id": "int"}},
+            absent=["target_user"],
+        )
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setenv("OSPREY_SCHEMAS_DIR", tmp_dir)
+            warnings = _get_warnings(
+                run_validation,
+                {
+                    "main.sml": """
+                    ActionName = GetActionName()
+                    Require(rule=f"actions/{ActionName}.sml")
+                    """,
+                    "actions/test_action.sml": """
+                    TargetId: int = JsonData(path='$.target_user.id')
+                    """,
+                },
+            )
+
+        # Exactly one warning for the absent-field usage
+        assert len(warnings) >= 1, f"Expected at least one warning, got {warnings}"
+        messages = [w.message for w in warnings]
+        absent_warning = next(
+            (m for m in messages if "absent" in m.lower() and "target_user" in m),
+            None,
+        )
+        assert absent_warning is not None, (
+            f"Expected absent-field warning, got messages: {messages}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test: Check 3 — unknown field (group present, field not listed) emits a warning
+# ---------------------------------------------------------------------------
+
+def test_cross_check_unknown_field_emits_warning(run_validation: RunValidationFunction) -> None:
+    """Check 3: a rule that extracts a field not listed in schema.provides emits a warning."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _write_schema(
+            Path(tmp_dir),
+            action="test_action",
+            provides={"user": {"id": "int"}},  # user.email is NOT listed
+            absent=[],
+        )
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setenv("OSPREY_SCHEMAS_DIR", tmp_dir)
+            warnings = _get_warnings(
+                run_validation,
+                {
+                    "main.sml": """
+                    ActionName = GetActionName()
+                    Require(rule=f"actions/{ActionName}.sml")
+                    """,
+                    "actions/test_action.sml": """
+                    UserEmail: str = JsonData(path='$.user.email')
+                    """,
+                },
+            )
+
+        # Exactly one warning for the unknown field
+        assert len(warnings) >= 1, f"Expected at least one warning, got {warnings}"
+        messages = [w.message for w in warnings]
+        unknown_warning = next(
+            (m for m in messages if "user.email" in m or "unknown" in m.lower() or "schema" in m.lower()),
+            None,
+        )
+        assert unknown_warning is not None, (
+            f"Expected unknown-field warning, got messages: {messages}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test: no false-positive warnings for present + known fields
+# ---------------------------------------------------------------------------
+
+def test_cross_check_no_warnings_for_known_fields(run_validation: RunValidationFunction) -> None:
+    """No warnings should be emitted when the rule extracts a known, present field."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        _write_schema(
+            Path(tmp_dir),
+            action="test_action",
+            provides={"user": {"id": "int", "email": "str"}},
+            absent=[],
+        )
+        with pytest.MonkeyPatch().context() as mp:
+            mp.setenv("OSPREY_SCHEMAS_DIR", tmp_dir)
+            warnings = _get_warnings(
+                run_validation,
+                {
+                    "main.sml": """
+                    ActionName = GetActionName()
+                    Require(rule=f"actions/{ActionName}.sml")
+                    """,
+                    "actions/test_action.sml": """
+                    UserId: int = JsonData(path='$.user.id')
+                    UserEmail: str = JsonData(path='$.user.email')
+                    """,
+                },
+            )
+
+        assert len(warnings) == 0, (
+            f"Expected no warnings for known present fields, got {[w.message for w in warnings]}"
+        )

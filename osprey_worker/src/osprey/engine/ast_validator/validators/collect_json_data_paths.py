@@ -316,40 +316,74 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
         return load_schema_for_action(action_name, schemas_dir)
 
     def _cross_check_types(self) -> None:
-        """Minimal type-drift cross-check (§4.6).
+        """Consumer-side contract validation (§4.6).
 
         If OSPREY_SCHEMAS_DIR is set and a schema exists for an action, emit
-        warnings for fields whose declared type in the schema differs from the
-        rvalue type read in the rule.
+        warnings for three categories of drift:
+
+        Check 1 — Absent-field usage: the rule extracts a path whose top-level
+          group is declared absent in the schema.  The specializer will prune
+          this node at runtime, so the extraction is dead code.
+
+        Check 2 — Type mismatch: the schema declares a field with a different
+          type than the rvalue annotation in the rule.
+
+        Check 3 — Unknown field: the rule extracts a path from a group that
+          the schema declares as provided, but the specific field is not listed
+          in provides.  The schema may need updating.
         """
         for action_name, fields in self._manifest.items():
             schema = self._load_schema_if_present(action_name)
             if schema is None:
                 continue
             for field in fields:
-                path_key = field.path.removeprefix("$.")
-                declared = schema.provides_field_types.get(path_key)
-                if declared is None:
+                source = self.context.sources.get_by_path(field.source_file)
+                if source is None:
                     continue
-                actual = _normalize_rvalue_type(field.rvalue_type)
-                if actual != declared:
-                    # Emit a warning — we need a span; use a placeholder from the source
-                    source = self.context.sources.get_by_path(field.source_file)
-                    if source is None:
-                        continue
-                    # Build a minimal Span pointing at the call's line/col
-                    span = Span(
-                        source=source,
-                        start_line=field.span_start_line,
-                        start_pos=field.span_start_col,
-                    )
+                span = Span(
+                    source=source,
+                    start_line=field.span_start_line,
+                    start_pos=field.span_start_col,
+                )
+
+                # Check 1: absent-field usage
+                if field.top_level_group in schema.absent_groups:
                     self.context.add_warning(
                         message=(
-                            f"{action_name}: {field.path} declared {declared!r} in schema "
-                            f"but rule reads {actual!r}"
+                            f"{action_name}: extracts {field.path!r} from group "
+                            f"{field.top_level_group!r} which the schema declares absent. "
+                            f"This node will be pruned at runtime."
                         ),
                         span=span,
-                        hint="Possible InvalidJsonType at runtime — update schema or rule.",
+                    )
+                    continue  # No further checks needed for absent fields
+
+                path_key = field.path.removeprefix("$.")
+
+                # Check 2: type mismatch (only for fields in a provided group)
+                declared = schema.provides_field_types.get(path_key)
+                if declared is not None:
+                    actual = _normalize_rvalue_type(field.rvalue_type)
+                    if actual != declared:
+                        self.context.add_warning(
+                            message=(
+                                f"{action_name}: {field.path} declared {declared!r} in schema "
+                                f"but rule reads {actual!r}"
+                            ),
+                            span=span,
+                            hint="Possible InvalidJsonType at runtime — update schema or rule.",
+                        )
+                    continue  # Field is known to the schema, no Check 3 needed
+
+                # Check 3: unknown field — group is provided but this specific field is not listed
+                if field.top_level_group in schema.provides_groups:
+                    self.context.add_warning(
+                        message=(
+                            f"{action_name}: extracts {field.path!r} but schema does not "
+                            f"declare it in provides for group {field.top_level_group!r}. "
+                            f"Schema may need updating."
+                        ),
+                        span=span,
                     )
 
 
