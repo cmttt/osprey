@@ -9,7 +9,6 @@ where action_name is derived from `actions/<name>.sml` paths.
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +20,7 @@ from osprey.engine.ast.grammar import Assign, Call, Name, Source, Span
 from osprey.engine.ast_validator.base_validator import BaseValidator, HasResult
 from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
-from osprey.engine.schema.schema_loader import load_schema_for_action
+from osprey.engine.schema.schema_loader import load_schema_for_action, resolve_schemas_dir
 from osprey.engine.stdlib.udfs.require import Require
 
 try:
@@ -303,16 +302,16 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
         )
 
     def _load_schema_if_present(self, action_name: str) -> Optional[object]:
-        """Load the schema for this action if a schemas_dir is configured.
+        """Load the schema for this action from the resolved schemas directory.
 
-        Returns None if no schema directory is configured or no schema exists.
-        This is called from _cross_check_types().
+        Returns None if no schema directory is discoverable (neither
+        ``OSPREY_SCHEMAS_DIR`` nor ``OSPREY_RULES_PATH/schemas`` resolves)
+        or no schema file exists for the action. Called from
+        :meth:`_cross_check_types`.
         """
-        schemas_dir_str = os.environ.get("OSPREY_SCHEMAS_DIR", "")
-        if not schemas_dir_str:
+        schemas_dir = resolve_schemas_dir()
+        if schemas_dir is None:
             return None
-
-        schemas_dir = Path(schemas_dir_str)
         return load_schema_for_action(action_name, schemas_dir)
 
     def _cross_check_types(self) -> None:

@@ -1,5 +1,4 @@
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
@@ -32,7 +31,7 @@ from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execu
 from osprey.engine.executor.executor import execute
 from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
-from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action
+from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action, resolve_schemas_dir
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
@@ -132,17 +131,15 @@ class OspreyEngine:
         return self._execution_graph_compilation_thread_pool.apply(_do_compile_execution_graph)
 
     def _load_and_register_schemas(self) -> None:
-        """Read schemas from $OSPREY_SCHEMAS_DIR and register specialized graphs.
+        """Load schemas from the resolved schemas directory and register
+        specialized graphs.
 
-        Called after every compilation (init + reload). No-op if env var unset
-        or directory empty/missing.
+        Called after every compilation (init + reload). No-op if
+        :func:`resolve_schemas_dir` returns ``None`` (neither
+        ``OSPREY_SCHEMAS_DIR`` nor ``OSPREY_RULES_PATH/schemas`` resolves).
         """
-        schemas_dir_str = os.environ.get("OSPREY_SCHEMAS_DIR", "")
-        if not schemas_dir_str:
-            return
-        schemas_dir = Path(schemas_dir_str)
-        if not schemas_dir.is_dir():
-            log.warning("OSPREY_SCHEMAS_DIR=%r is not a directory; skipping schema load", schemas_dir_str)
+        schemas_dir = resolve_schemas_dir()
+        if schemas_dir is None:
             return
 
         action_names = self.get_known_action_names()

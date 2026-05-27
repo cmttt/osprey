@@ -240,6 +240,64 @@ def test_specialized_graph_executes_identically_on_payload_subset() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test: misclassified absent group — divergence pinned, no crash
+# ---------------------------------------------------------------------------
+
+def test_misclassified_absent_group_divergence_pinned() -> None:
+    """Pin the failure mode for a schema that declares a group absent while the
+    runtime payload actually contains it.
+
+    Expected behavior under the current design:
+      - Default graph extracts the value.
+      - Specialized graph pruned the extractor chain at compile time, so the
+        feature is *missing* from extracted_features (NOT set to ``None``,
+        NOT raised, NOT fallback-to-default-graph).
+
+    This is a divergent-output failure, not a same-as-default-graph failure.
+    The PR description framed misclassification as "None values, same as the
+    default graph" — that description is only accurate when the payload also
+    omits the field. When the schema is wrong AND the field is present, the
+    specialized graph silently drops the feature.
+
+    Today's safety nets:
+      - CollectJsonDataPaths' Check 1 emits a compile-time warning when a rule
+        extracts from a declared-absent group (caught the original 3 mistakes).
+      - BQ replay job validates schemas against historical payloads.
+
+    Production observability for default-vs-specialized divergence is out of
+    scope for the initial rollout (deferred shadow-mode work).
+    """
+    _, graph = _compile(
+        {
+            "main.sml": """
+            UserId: int = JsonData(path='$.user.id')
+            TargetId: Optional[int] = JsonData(path='$.target_user.id', required=False)
+            """,
+        }
+    )
+    # Schema MIS-CLASSIFIES target_user as absent.
+    schema = _make_schema(
+        provides={"user": {"id": "int"}},
+        absent=["target_user"],
+    )
+    # Payload contradicts the schema: target_user IS present.
+    payload = {"user": {"id": 1}, "target_user": {"id": 999}}
+
+    default_result = _run_graph(graph, payload)
+    specialized = specialize_graph(graph, schema)
+    specialized_result = _run_graph(specialized, payload)
+
+    # Default graph extracts the real value.
+    assert default_result.get("TargetId") == 999
+    # Specialized graph PRUNED the extractor — feature is missing from result,
+    # not set to None. This is the divergence.
+    assert "TargetId" not in specialized_result
+    # User-side data still works (specialization didn't break unrelated chains).
+    assert default_result.get("UserId") == 1
+    assert specialized_result.get("UserId") == 1
+
+
+# ---------------------------------------------------------------------------
 # Test: idempotent across runs
 # ---------------------------------------------------------------------------
 

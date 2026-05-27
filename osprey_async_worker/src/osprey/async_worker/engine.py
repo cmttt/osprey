@@ -8,7 +8,6 @@ Provides async execute() that calls the async executor directly.
 import asyncio
 import gc
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import time
@@ -41,7 +40,7 @@ from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
-from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action
+from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action, resolve_schemas_dir
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.worker.lib.instruments import metrics
@@ -225,8 +224,17 @@ class AsyncOspreyEngine:
 
         log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
 
-        # Reload typed-action-contracts specialized graphs against the new full graph.
-        self._load_and_register_schemas()
+        # Reload typed-action-contracts specialized graphs against the new full
+        # graph. Hoisted off the event loop because specialize_graph walks every
+        # chain in the full graph and, scaled across all schema'd actions
+        # (~hundreds), would block the bridge loop the sources-watcher trampoline
+        # runs on. During the window between _specialized_graphs.clear() above
+        # and re-population here, execute() correctly falls back to the new
+        # full graph for schema'd actions — the dispatch is `dict.get(name,
+        # _execution_graph)`, so a partially-populated dict is consistent.
+        await asyncio.get_running_loop().run_in_executor(
+            self._thread_pool, self._load_and_register_schemas
+        )
 
         self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
 
@@ -308,17 +316,18 @@ class AsyncOspreyEngine:
         log.info("Registered specialized graph for action %r", action_name)
 
     def _load_and_register_schemas(self) -> None:
-        """Read schemas from $OSPREY_SCHEMAS_DIR and register specialized graphs.
+        """Load schemas from the resolved schemas directory and register
+        specialized graphs.
 
-        Called after every compilation (init + reload). No-op if env var unset
-        or directory empty/missing. Mirrors OspreyEngine._load_and_register_schemas.
+        Synchronous, CPU-heavy: each ``specialize_graph`` call walks every
+        chain in the full graph. On the reload path this is dispatched via
+        ``run_in_executor`` to keep the bridge loop responsive.
+
+        No-op if :func:`resolve_schemas_dir` returns ``None``. Mirrors
+        :meth:`OspreyEngine._load_and_register_schemas` in the gevent variant.
         """
-        schemas_dir_str = os.environ.get("OSPREY_SCHEMAS_DIR", "")
-        if not schemas_dir_str:
-            return
-        schemas_dir = Path(schemas_dir_str)
-        if not schemas_dir.is_dir():
-            log.warning("OSPREY_SCHEMAS_DIR=%r is not a directory; skipping schema load", schemas_dir_str)
+        schemas_dir = resolve_schemas_dir()
+        if schemas_dir is None:
             return
 
         action_names = self.get_known_action_names()
