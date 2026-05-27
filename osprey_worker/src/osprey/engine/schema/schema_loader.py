@@ -5,6 +5,7 @@ Schema format is defined in §4.3 of the typed-action-contracts plan.
 """
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Set
@@ -145,6 +146,36 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
         provides_field_types=provides_field_types,
         optional_for=optional_for,
     )
+
+
+def resolve_schemas_dir() -> Optional[Path]:
+    """Discover the schemas directory from the runtime environment.
+
+    Resolution order:
+      1. ``OSPREY_SCHEMAS_DIR`` if set and points at an existing directory.
+      2. ``<OSPREY_RULES_PATH>/schemas`` if that env var is set and the
+         ``schemas`` subdirectory exists in the rules tree.
+
+    Returns ``None`` if neither path resolves to an existing directory.
+
+    The fallback to ``OSPREY_RULES_PATH/schemas`` lets typed contracts
+    activate in environments that already point the worker at a smite-rules
+    checkout, without requiring a separate env var or deployment change.
+    """
+    explicit = os.environ.get("OSPREY_SCHEMAS_DIR", "").strip()
+    if explicit:
+        candidate = Path(explicit)
+        if candidate.is_dir():
+            return candidate
+        log.warning("OSPREY_SCHEMAS_DIR=%r is not a directory; ignoring", explicit)
+
+    rules_path = os.environ.get("OSPREY_RULES_PATH", "").strip()
+    if rules_path:
+        candidate = Path(rules_path) / "schemas"
+        if candidate.is_dir():
+            return candidate
+
+    return None
 
 
 def load_schema_for_action(action_name: str, schemas_dir: Path) -> Optional[ActionSchema]:

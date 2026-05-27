@@ -10,6 +10,7 @@ from osprey.engine.schema.schema_loader import (
     SchemaLoadError,
     load_schema,
     load_schema_for_action,
+    resolve_schemas_dir,
 )
 
 _VALID_SCHEMA = {
@@ -202,3 +203,47 @@ class TestSchemaLoader:
         assert len(schema.provides_groups) == 0
         assert len(schema.absent_groups) == 0
         assert len(schema.provides_field_types) == 0
+
+
+class TestResolveSchemasDir:
+    """resolve_schemas_dir picks up schemas without an explicit env var when
+    OSPREY_RULES_PATH already points at a smite-rules checkout that has a
+    ``schemas/`` subdirectory — this is what makes typed contracts activate in
+    prod without requiring a separate deployment change.
+    """
+
+    def test_returns_none_when_no_env_set(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.delenv("OSPREY_SCHEMAS_DIR", raising=False)
+        monkeypatch.delenv("OSPREY_RULES_PATH", raising=False)
+        assert resolve_schemas_dir() is None
+
+    def test_explicit_schemas_dir_wins(self, monkeypatch, tmp_path: Path) -> None:
+        schemas = tmp_path / "explicit"
+        schemas.mkdir()
+        rules = tmp_path / "rules"
+        (rules / "schemas").mkdir(parents=True)
+        monkeypatch.setenv("OSPREY_SCHEMAS_DIR", str(schemas))
+        monkeypatch.setenv("OSPREY_RULES_PATH", str(rules))
+        assert resolve_schemas_dir() == schemas
+
+    def test_falls_back_to_rules_path_schemas_subdir(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.delenv("OSPREY_SCHEMAS_DIR", raising=False)
+        rules = tmp_path / "smite-rules"
+        (rules / "schemas").mkdir(parents=True)
+        monkeypatch.setenv("OSPREY_RULES_PATH", str(rules))
+        assert resolve_schemas_dir() == rules / "schemas"
+
+    def test_returns_none_when_rules_path_has_no_schemas_subdir(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.delenv("OSPREY_SCHEMAS_DIR", raising=False)
+        rules = tmp_path / "smite-rules"
+        rules.mkdir()  # no schemas/ subdir
+        monkeypatch.setenv("OSPREY_RULES_PATH", str(rules))
+        assert resolve_schemas_dir() is None
+
+    def test_ignores_explicit_dir_that_does_not_exist(self, monkeypatch, tmp_path: Path) -> None:
+        rules = tmp_path / "smite-rules"
+        (rules / "schemas").mkdir(parents=True)
+        monkeypatch.setenv("OSPREY_SCHEMAS_DIR", str(tmp_path / "does-not-exist"))
+        monkeypatch.setenv("OSPREY_RULES_PATH", str(rules))
+        # Explicit dir is invalid → falls through to OSPREY_RULES_PATH/schemas
+        assert resolve_schemas_dir() == rules / "schemas"
