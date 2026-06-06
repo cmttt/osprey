@@ -124,6 +124,9 @@ class WhenRulesAuditEntry:
     effects_emitted: List[str]
     effects_failed: int
     is_degraded: bool
+    skipped_by_tier: bool = False
+    """True if this WhenRules block was skipped because its tier did not match
+    the execution mode. When True, effects_emitted is empty."""
 
 
 class ExecutionContext:
@@ -236,6 +239,14 @@ class ExecutionContext:
     def get_action_name(self) -> str:
         """Returns the action name that the execution context is currently being invoked upon."""
         return self._action.action_name
+
+    def get_execution_mode(self) -> str:
+        """Returns the execution mode of the current action: 'sync', 'async', or 'unspecified'.
+
+        'unspecified' indicates the producer did not stamp a mode (older coordinator binary).
+        Tier filtering by WhenRules treats 'unspecified' as a no-op — all WhenRules fire
+        regardless of their tier annotation. This preserves pre-tier-system behavior."""
+        return self._action.execution_mode
 
     def get_action_time(self) -> datetime:
         """Returns the time of the action that the execution context is currently being invoked upon."""
@@ -395,6 +406,8 @@ class Action:
     timestamp: datetime
     secret_data: Dict[str, Any] = field(default_factory=dict)
     encoding: str = 'unknown'
+    execution_mode: str = 'unspecified'
+    """Execution mode for tier filtering: 'sync', 'async', or 'unspecified' (no filtering)."""
 
     @classmethod
     def from_dict(cls: Type[_ActionT], d: Dict[str, Any]) -> '_ActionT':
@@ -404,6 +417,7 @@ class Action:
             data=d['data'],
             secret_data=d.get('secret', {}),
             timestamp=datetime.fromisoformat(d['timestamp']),
+            execution_mode=d.get('execution_mode', 'unspecified'),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -413,6 +427,7 @@ class Action:
             'action_name': self.action_name,
             'data': self.data,
             'timestamp': self.timestamp.isoformat(),
+            'execution_mode': self.execution_mode,
         }
 
     @cached_property

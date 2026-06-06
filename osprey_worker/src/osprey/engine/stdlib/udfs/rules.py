@@ -10,8 +10,9 @@ from osprey.engine.language_types.rules import RuleT
 from osprey.engine.udf.type_helpers import validate_kwarg_node_type
 from osprey.worker.lib.instruments import metrics
 
-from ._prelude import ArgumentsBase, ExecutionContext, UDFBase, ValidationContext
+from ._prelude import ArgumentsBase, ConstExpr, ExecutionContext, UDFBase, ValidationContext
 from .categories import UdfCategories
+from .tier_constants import ALWAYS_FIRES, UNSPECIFIED_MODE, VALID_TIERS
 
 _HAS_FORMAT_STRING_RE = re.compile(r'\{([^\d\W]\w*)\}')
 
@@ -118,12 +119,45 @@ class WhenRulesArguments(ArgumentsBase):
     rules_any: List[RuleT]
     # TODO - Should we require this be non-empty?
     then: List[EffectBase]
+    tier: ConstExpr[str] = ConstExpr.for_default('tier', 'legacy')
+    """Execution tier for this WhenRules block.
+
+    Allowed values:
+    - "sync": fires only when execution_mode == "sync"
+    - "async": fires only when execution_mode == "async"
+    - "both": fires in both modes (state-mutating effects forbidden — see ValidateTierConstraints)
+    - "legacy" (default): fires regardless of execution_mode; preserves pre-tier-system behavior
+    """
 
 
 class WhenRules(UDFBase[WhenRulesArguments, None]):
     """Binds rules to effects. When any of the referenced rules fire, the then= effects are applied."""
 
     category = UdfCategories.ENGINE
+
+    def __init__(self, validation_context: ValidationContext, arguments: WhenRulesArguments) -> None:
+        super().__init__(validation_context, arguments)
+
+        # Validate tier value at compile time — only when explicitly supplied by the author.
+        if arguments.has_argument_ast('tier'):
+            tier_ast = arguments.get_argument_ast('tier')
+            if isinstance(tier_ast, grammar.String):
+                if tier_ast.value not in VALID_TIERS:
+                    valid_tiers_str = ', '.join(f'`{t}`' for t in sorted(VALID_TIERS))
+                    validation_context.add_error(
+                        message=f'invalid tier value: `{tier_ast.value}`',
+                        span=tier_ast.span,
+                        hint=(
+                            f'allowed tiers are: {valid_tiers_str}'
+                            '\nomit the kwarg to default to `legacy` behavior'
+                        ),
+                    )
+            else:
+                validation_context.add_error(
+                    message='`tier` must be a string literal',
+                    span=tier_ast.span,
+                    hint='example: `WhenRules(rules_any=[...], then=[...], tier=`async`)`',
+                )
 
     def resolve_arguments(self, execution_context: ExecutionContext, call_executor: CallExecutor) -> WhenRulesArguments:
         # WhenRules has some custom resolve logic, in order to tolerate a failure in the `rules_any` dependency chain.
@@ -184,6 +218,32 @@ class WhenRules(UDFBase[WhenRulesArguments, None]):
         )
 
     def execute(self, execution_context: ExecutionContext, arguments: WhenRulesArguments) -> None:
+        # Tier filtering: skip when the declared tier doesn't match the execution mode.
+        # "legacy" (default) and "both" always fire. "unspecified" execution mode (older
+        # coordinator binaries that don't stamp mode) bypasses filtering for back-compat.
+        tier = arguments.tier.value
+        if tier not in ALWAYS_FIRES:
+            mode = execution_context.get_execution_mode()
+            if mode != UNSPECIFIED_MODE and mode != tier:
+                execution_context.add_rule_audit_entry(WhenRulesAuditEntry(
+                    rules_evaluated=[rule.name for rule in arguments.rules_any],
+                    rules_matched=[],
+                    rules_failed=[],
+                    effects_emitted=[],
+                    effects_failed=0,
+                    is_degraded=False,
+                    skipped_by_tier=True,
+                ))
+                metrics.increment(
+                    'osprey.when_rules_tier_skipped',
+                    tags=[
+                        f'action:{execution_context.get_action_name()}',
+                        f'tier:{tier}',
+                        f'mode:{mode}',
+                    ],
+                )
+                return
+
         all_rule_names = [rule.name for rule in arguments.rules_any]
         passing_rules = [rule for rule in arguments.rules_any if rule.value]
         passing_names = [rule.name for rule in passing_rules]
