@@ -32,6 +32,8 @@ class Action(google.protobuf.message.Message):
     OSPREY_AUTO_CLUSTERING_KEY_FIELD_NUMBER: builtins.int
     HASH_MATCHER_ICON_MATCHED_FIELD_NUMBER: builtins.int
     SAFETY_VISUAL_PREDICTION_FIELD_NUMBER: builtins.int
+    GUILD_BATCH_ML_SCORE_FIELD_NUMBER: builtins.int
+    GUILD_CONDO_DETECTED_FIELD_NUMBER: builtins.int
     id: builtins.int
     """Snowflake id of action message
     Currently actions from discord_authentication use a pseudo snowflake to reduce dependencies.
@@ -60,6 +62,10 @@ class Action(google.protobuf.message.Message):
     def hash_matcher_icon_matched(self) -> global___HashMatcherIconMatched: ...
     @property
     def safety_visual_prediction(self) -> global___SafetyVisualPrediction: ...
+    @property
+    def guild_batch_ml_score(self) -> global___GuildBatchMLScore: ...
+    @property
+    def guild_condo_detected(self) -> global___GuildCondoDetected: ...
     def __init__(
         self,
         *,
@@ -76,10 +82,12 @@ class Action(google.protobuf.message.Message):
         osprey_auto_clustering_key: global___OspreyAutoClusteringKey | None = ...,
         hash_matcher_icon_matched: global___HashMatcherIconMatched | None = ...,
         safety_visual_prediction: global___SafetyVisualPrediction | None = ...,
+        guild_batch_ml_score: global___GuildBatchMLScore | None = ...,
+        guild_condo_detected: global___GuildCondoDetected | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["auth_session_created", b"auth_session_created", "auth_session_modified", b"auth_session_modified", "data", b"data", "guild_created", b"guild_created", "guild_flink_application_scored", b"guild_flink_application_scored", "guild_joined", b"guild_joined", "hash_matcher_icon_matched", b"hash_matcher_icon_matched", "osprey_auto_clustering_key", b"osprey_auto_clustering_key", "osprey_auto_clustering_user", b"osprey_auto_clustering_user", "safety_visual_prediction", b"safety_visual_prediction", "user_batch_ml_score", b"user_batch_ml_score", "user_blocked", b"user_blocked", "user_flink_application_scored", b"user_flink_application_scored"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["auth_session_created", b"auth_session_created", "auth_session_modified", b"auth_session_modified", "data", b"data", "guild_created", b"guild_created", "guild_flink_application_scored", b"guild_flink_application_scored", "guild_joined", b"guild_joined", "hash_matcher_icon_matched", b"hash_matcher_icon_matched", "id", b"id", "osprey_auto_clustering_key", b"osprey_auto_clustering_key", "osprey_auto_clustering_user", b"osprey_auto_clustering_user", "safety_visual_prediction", b"safety_visual_prediction", "user_batch_ml_score", b"user_batch_ml_score", "user_blocked", b"user_blocked", "user_flink_application_scored", b"user_flink_application_scored"]) -> None: ...
-    def WhichOneof(self, oneof_group: typing.Literal["data", b"data"]) -> typing.Literal["auth_session_created", "auth_session_modified", "user_flink_application_scored", "guild_flink_application_scored", "guild_created", "user_batch_ml_score", "user_blocked", "guild_joined", "osprey_auto_clustering_user", "osprey_auto_clustering_key", "hash_matcher_icon_matched", "safety_visual_prediction"] | None: ...
+    def HasField(self, field_name: typing.Literal["auth_session_created", b"auth_session_created", "auth_session_modified", b"auth_session_modified", "data", b"data", "guild_batch_ml_score", b"guild_batch_ml_score", "guild_condo_detected", b"guild_condo_detected", "guild_created", b"guild_created", "guild_flink_application_scored", b"guild_flink_application_scored", "guild_joined", b"guild_joined", "hash_matcher_icon_matched", b"hash_matcher_icon_matched", "osprey_auto_clustering_key", b"osprey_auto_clustering_key", "osprey_auto_clustering_user", b"osprey_auto_clustering_user", "safety_visual_prediction", b"safety_visual_prediction", "user_batch_ml_score", b"user_batch_ml_score", "user_blocked", b"user_blocked", "user_flink_application_scored", b"user_flink_application_scored"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["auth_session_created", b"auth_session_created", "auth_session_modified", b"auth_session_modified", "data", b"data", "guild_batch_ml_score", b"guild_batch_ml_score", "guild_condo_detected", b"guild_condo_detected", "guild_created", b"guild_created", "guild_flink_application_scored", b"guild_flink_application_scored", "guild_joined", b"guild_joined", "hash_matcher_icon_matched", b"hash_matcher_icon_matched", "id", b"id", "osprey_auto_clustering_key", b"osprey_auto_clustering_key", "osprey_auto_clustering_user", b"osprey_auto_clustering_user", "safety_visual_prediction", b"safety_visual_prediction", "user_batch_ml_score", b"user_batch_ml_score", "user_blocked", b"user_blocked", "user_flink_application_scored", b"user_flink_application_scored"]) -> None: ...
+    def WhichOneof(self, oneof_group: typing.Literal["data", b"data"]) -> typing.Literal["auth_session_created", "auth_session_modified", "user_flink_application_scored", "guild_flink_application_scored", "guild_created", "user_batch_ml_score", "user_blocked", "guild_joined", "osprey_auto_clustering_user", "osprey_auto_clustering_key", "hash_matcher_icon_matched", "safety_visual_prediction", "guild_batch_ml_score", "guild_condo_detected"] | None: ...
 
 global___Action = Action
 
@@ -261,6 +269,102 @@ class UserBatchMLScore(google.protobuf.message.Message):
     def ClearField(self, field_name: typing.Literal["application_name", b"application_name", "application_version", b"application_version", "cluster", b"cluster", "orchestration_job", b"orchestration_job", "score", b"score", "source_event", b"source_event", "timestamp", b"timestamp", "user", b"user"]) -> None: ...
 
 global___UserBatchMLScore = UserBatchMLScore
+
+@typing.final
+class GuildBatchMLScore(google.protobuf.message.Message):
+    """Per-guild batch ML score, emitted by the rum2024/com_guild Dagster pipeline.
+    Mirrors discord_smite_rpc.actions.v1.GuildBatchMLScore (oneof field 14) so
+    the asyncio coordinator can decode these actions.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    TIMESTAMP_FIELD_NUMBER: builtins.int
+    GUILD_FIELD_NUMBER: builtins.int
+    ORCHESTRATION_JOB_FIELD_NUMBER: builtins.int
+    APPLICATION_NAME_FIELD_NUMBER: builtins.int
+    APPLICATION_VERSION_FIELD_NUMBER: builtins.int
+    SCORE_FIELD_NUMBER: builtins.int
+    CLUSTER_FIELD_NUMBER: builtins.int
+    SOURCE_EVENT_FIELD_NUMBER: builtins.int
+    application_name: builtins.str
+    application_version: builtins.str
+    score: builtins.float
+    @property
+    def timestamp(self) -> google.protobuf.timestamp_pb2.Timestamp: ...
+    @property
+    def guild(self) -> global___GuildBatchML: ...
+    @property
+    def orchestration_job(self) -> global___OrchestrationJob: ...
+    @property
+    def cluster(self) -> global___BatchMLCluster: ...
+    @property
+    def source_event(self) -> global___BatchMLSourceEvent: ...
+    def __init__(
+        self,
+        *,
+        timestamp: google.protobuf.timestamp_pb2.Timestamp | None = ...,
+        guild: global___GuildBatchML | None = ...,
+        orchestration_job: global___OrchestrationJob | None = ...,
+        application_name: builtins.str = ...,
+        application_version: builtins.str = ...,
+        score: builtins.float = ...,
+        cluster: global___BatchMLCluster | None = ...,
+        source_event: global___BatchMLSourceEvent | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["cluster", b"cluster", "guild", b"guild", "orchestration_job", b"orchestration_job", "source_event", b"source_event", "timestamp", b"timestamp"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["application_name", b"application_name", "application_version", b"application_version", "cluster", b"cluster", "guild", b"guild", "orchestration_job", b"orchestration_job", "score", b"score", "source_event", b"source_event", "timestamp", b"timestamp"]) -> None: ...
+
+global___GuildBatchMLScore = GuildBatchMLScore
+
+@typing.final
+class GuildCondoDetected(google.protobuf.message.Message):
+    """Per-guild action emitted by the Roblox condo scan auto-enforcement Dagster
+    pipeline. Mirrors discord_smite_rpc.actions.v1.GuildCondoDetected (oneof
+    field 15) so the asyncio coordinator can decode these actions.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    TIMESTAMP_FIELD_NUMBER: builtins.int
+    GUILD_ID_FIELD_NUMBER: builtins.int
+    CONFIDENCE_FIELD_NUMBER: builtins.int
+    REASONS_FIELD_NUMBER: builtins.int
+    RAW_RATIONALE_FIELD_NUMBER: builtins.int
+    MODEL_VERSION_FIELD_NUMBER: builtins.int
+    ORCHESTRATION_JOB_FIELD_NUMBER: builtins.int
+    guild_id: builtins.int
+    confidence: builtins.str
+    """'HIGH' | 'MEDIUM' | 'LOW' classifier confidence tier."""
+    model_version: builtins.str
+    """Detector model version (e.g., 'gemma-3-27b-2026-04')."""
+    @property
+    def timestamp(self) -> google.protobuf.timestamp_pb2.Timestamp: ...
+    @property
+    def reasons(self) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.str]:
+        """Structured tags from the classifier (e.g., 'invite_link_present')."""
+
+    @property
+    def raw_rationale(self) -> google.protobuf.wrappers_pb2.StringValue:
+        """Free-text rationale; optional (StringValue rather than proto3 optional)."""
+
+    @property
+    def orchestration_job(self) -> global___OrchestrationJob: ...
+    def __init__(
+        self,
+        *,
+        timestamp: google.protobuf.timestamp_pb2.Timestamp | None = ...,
+        guild_id: builtins.int = ...,
+        confidence: builtins.str = ...,
+        reasons: collections.abc.Iterable[builtins.str] | None = ...,
+        raw_rationale: google.protobuf.wrappers_pb2.StringValue | None = ...,
+        model_version: builtins.str = ...,
+        orchestration_job: global___OrchestrationJob | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["orchestration_job", b"orchestration_job", "raw_rationale", b"raw_rationale", "timestamp", b"timestamp"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["confidence", b"confidence", "guild_id", b"guild_id", "model_version", b"model_version", "orchestration_job", b"orchestration_job", "raw_rationale", b"raw_rationale", "reasons", b"reasons", "timestamp", b"timestamp"]) -> None: ...
+
+global___GuildCondoDetected = GuildCondoDetected
 
 @typing.final
 class OspreyAutoClusteringUser(google.protobuf.message.Message):
@@ -554,6 +658,23 @@ class UserBatchML(google.protobuf.message.Message):
     def ClearField(self, field_name: typing.Literal["id", b"id"]) -> None: ...
 
 global___UserBatchML = UserBatchML
+
+@typing.final
+class GuildBatchML(google.protobuf.message.Message):
+    """Guild field for Batch ML jobs"""
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    ID_FIELD_NUMBER: builtins.int
+    id: builtins.int
+    def __init__(
+        self,
+        *,
+        id: builtins.int = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["id", b"id"]) -> None: ...
+
+global___GuildBatchML = GuildBatchML
 
 @typing.final
 class UserHashMatcher(google.protobuf.message.Message):
