@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
 from typing import Callable, Dict, Generic, List, Optional, Set, Tuple, Type, TypeVar
@@ -29,7 +29,9 @@ from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, Mode
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.executor import execute
+from osprey.engine.executor.graph_specializer import specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
+from osprey.engine.schema.schema_loader import SchemaLoadError, load_schema_for_action, resolve_schemas_dir
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
@@ -92,6 +94,10 @@ class OspreyEngine:
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
+        # Specialized graphs for typed action contracts (§4.5 runtime dispatch)
+        # Maps action_name -> SpecializedExecutionGraph. Populated via register_specialized_graph().
+        self._specialized_graphs: Dict[str, ExecutionGraph] = {}
+        self._load_and_register_schemas()
 
     def _compile_execution_graph(self, disable_periodic_yield: bool = False) -> ExecutionGraph:
         def _do_compile_execution_graph() -> ExecutionGraph:
@@ -124,22 +130,68 @@ class OspreyEngine:
 
         return self._execution_graph_compilation_thread_pool.apply(_do_compile_execution_graph)
 
+    def _load_and_register_schemas(self) -> None:
+        """Load schemas from the resolved schemas directory and register
+        specialized graphs.
+
+        Called after every compilation (init + reload). No-op if
+        :func:`resolve_schemas_dir` returns ``None`` (neither
+        ``OSPREY_SCHEMAS_DIR`` nor ``OSPREY_RULES_PATH/schemas`` resolves).
+        """
+        schemas_dir = resolve_schemas_dir()
+        if schemas_dir is None:
+            return
+
+        action_names = self.get_known_action_names()
+        loaded = 0
+        for action_name in action_names:
+            try:
+                schema = load_schema_for_action(action_name, schemas_dir)
+            except SchemaLoadError as e:
+                log.warning("Failed to load schema for %s: %s", action_name, e)
+                continue
+            if schema is None:
+                continue
+            specialized = specialize_graph(self._execution_graph, schema)
+            self.register_specialized_graph(action_name, specialized)
+            loaded += 1
+        if loaded:
+            log.info("Loaded %d specialized graphs from %s", loaded, schemas_dir)
+
     def _handle_updated_sources(self) -> None:
-        # noinspection PyBroadException
         try:
-            self._execution_graph = self._compile_execution_graph()
-            log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+            new_graph = self._compile_execution_graph()
         except Exception:
             log.exception(
                 f'Failed to compile execution graph for sources={self._sources_provider.get_current_sources().hash()}'
             )
-        else:
-            # Only do this if no exception occurred above
-            self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
-            # Confirm to the provider which sources are now live so it dedups no-op
-            # re-deliveries against what we applied; the except branch above leaves
-            # it unmarked, so a failed compile retries on the next re-delivery.
-            self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
+            return  # Leave existing graph + specialized graphs intact
+
+        # Maintain dispatch-observable consistency across the graph swap.
+        # Invariant: _specialized_graphs always contains graphs backed by the
+        # CURRENT _execution_graph, or is empty.  Empty is always safe because
+        # execute() falls back to _execution_graph.
+        #
+        # Observable state transitions (sequential, no intermediate inconsistency):
+        #   (old_graph, old_specialized)   — before reload
+        #   (old_graph, {})                — after clear, before assign
+        #   (new_graph, {})                — after assign, before reload
+        #   (new_graph, new_specialized)   — after reload
+        #
+        # A concurrent execute() that sees (old_graph, {}) runs the full old graph —
+        # correct.  A concurrent execute() that sees (new_graph, {}) runs the full
+        # new graph — also correct.  The previous ordering (assign then clear) could
+        # expose (new_graph, old_specialized), which is never correct.
+        self._specialized_graphs.clear()
+        self._execution_graph = new_graph
+        log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+
+        self._load_and_register_schemas()
+        self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
+        # Confirm to the provider which sources are now live so it dedups no-op
+        # re-deliveries against what we applied; the early return above leaves
+        # it unmarked, so a failed compile retries on the next re-delivery.
+        self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
 
         # noinspection PyBroadException
         # try to send validation results, should not block osprey_engine if this fails
@@ -203,6 +255,15 @@ class OspreyEngine:
         """Returns a mapping from 'rule name' -> 'rule description' for each feature that is a rule declaration."""
         return self._execution_graph.validated_sources.get_validator_result(RuleNameToDescriptionMapping)
 
+    def register_specialized_graph(self, action_name: str, graph: ExecutionGraph) -> None:
+        """Register a specialized execution graph for a given action name.
+
+        When execute() is called for this action_name, the specialized graph will
+        be used instead of the default graph (§4.5 runtime dispatch).
+        """
+        self._specialized_graphs[action_name] = graph
+        log.info("Registered specialized graph for action %r", action_name)
+
     def execute(
         self,
         udf_helpers: UDFHelpers,
@@ -210,9 +271,15 @@ class OspreyEngine:
         sample_rate: int = 100,
         parent_tracer_span: Optional[TracerSpan] = None,
     ) -> ExecutionResult:
-        """Given input action, execute it against the execution engine and return the result."""
+        """Given input action, execute it against the execution engine and return the result.
+
+        If a specialized graph is registered for this action (via register_specialized_graph),
+        that graph is used. Otherwise the default full graph is used (§4.5 runtime dispatch).
+        Schema-less actions incur zero overhead — dict.get is O(1).
+        """
+        graph = self._specialized_graphs.get(action.action_name, self._execution_graph)
         return execute(
-            self._execution_graph,
+            graph,
             udf_helpers,
             action,
             gevent.pool.Pool(_DEFAULT_MAX_ASYNC_PER_EXECUTION),
