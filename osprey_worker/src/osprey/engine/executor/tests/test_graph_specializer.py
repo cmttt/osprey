@@ -738,10 +738,11 @@ def test_load_and_register_schemas_populates_specialized_graphs() -> None:
         engine._execution_graph = graph
         engine._specialized_graphs = {}
         engine.get_known_action_names = MagicMock(return_value={"guild_joined"})
+        # Cached gates (set in __init__): prune-all, no shadow.
+        engine._prune_filter = frozenset({"*"})
+        engine._shadow_filter = frozenset()
 
-        # Pruning must be explicitly enabled (the activation gate), in addition to
-        # OSPREY_SCHEMAS_DIR pointing at schema files.
-        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir, "OSPREY_TYPED_CONTRACT_PRUNING": "true"}):
+        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir}):
             OspreyEngine._load_and_register_schemas(engine)
 
         # Verify that register_specialized_graph was called for guild_joined
@@ -759,9 +760,12 @@ def test_load_and_register_schemas_noop_when_env_unset() -> None:
 
     engine = MagicMock(spec=OspreyEngine)
     engine._specialized_graphs = {}
+    engine._prune_filter = frozenset({"*"})  # gates enabled...
+    engine._shadow_filter = frozenset()
 
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("OSPREY_SCHEMAS_DIR", None)
+        os.environ.pop("OSPREY_RULES_PATH", None)  # ...but no schemas dir resolves
         OspreyEngine._load_and_register_schemas(engine)
 
     engine.register_specialized_graph.assert_not_called()
@@ -789,27 +793,119 @@ def test_load_and_register_schemas_noop_when_pruning_disabled() -> None:
         engine = MagicMock(spec=OspreyEngine)
         engine._specialized_graphs = {}
         engine.get_known_action_names = MagicMock(return_value={"guild_joined"})
-        # Schema dir IS set, but pruning flag is NOT enabled -> gate blocks registration.
+        # Schema dir IS set, but both gates are empty (default) -> no registration.
+        engine._prune_filter = frozenset()
+        engine._shadow_filter = frozenset()
         with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir}, clear=False):
-            os.environ.pop("OSPREY_TYPED_CONTRACT_PRUNING", None)
             OspreyEngine._load_and_register_schemas(engine)
         engine.register_specialized_graph.assert_not_called()
 
 
-def test_absent_pruning_enabled_env_parsing() -> None:
-    """absent_pruning_enabled() is false by default and only true for truthy values."""
+def test_action_filter_env_parsing() -> None:
+    """The prune/shadow env vars parse into per-action allowlists; default OFF."""
     from unittest.mock import patch
-    from osprey.engine.schema.schema_loader import absent_pruning_enabled
+    from osprey.engine.schema.schema_loader import (
+        pruning_action_filter, shadow_action_filter, filter_includes,
+    )
 
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("OSPREY_TYPED_CONTRACT_PRUNING", None)
-        assert absent_pruning_enabled() is False
-    for truthy in ("1", "true", "TRUE", "yes", "on"):
-        with patch.dict(os.environ, {"OSPREY_TYPED_CONTRACT_PRUNING": truthy}):
-            assert absent_pruning_enabled() is True
-    for falsy in ("", "0", "false", "no", "off", "nope"):
+        os.environ.pop("OSPREY_TYPED_CONTRACT_SHADOW", None)
+        assert pruning_action_filter() == frozenset()  # default OFF
+        assert shadow_action_filter() == frozenset()
+    for falsy in ("", "0", "false", "no", "off"):
         with patch.dict(os.environ, {"OSPREY_TYPED_CONTRACT_PRUNING": falsy}):
-            assert absent_pruning_enabled() is False
+            assert pruning_action_filter() == frozenset()
+    for allval in ("1", "true", "*", "all"):  # truthy scalar -> all actions
+        with patch.dict(os.environ, {"OSPREY_TYPED_CONTRACT_PRUNING": allval}):
+            f = pruning_action_filter()
+            assert filter_includes(f, "anything") and filter_includes(f, "guild_joined")
+    with patch.dict(os.environ, {"OSPREY_TYPED_CONTRACT_PRUNING": "guild_joined, api_user_deleted"}):
+        f = pruning_action_filter()
+        assert f == frozenset({"guild_joined", "api_user_deleted"})
+        assert filter_includes(f, "guild_joined")
+        assert not filter_includes(f, "message_sent")  # not listed
+
+
+def test_allowlist_registers_only_listed_actions() -> None:
+    """With a per-action prune allowlist, only the listed action is specialized."""
+    from unittest.mock import MagicMock, patch
+    from osprey.worker.lib.osprey_engine import OspreyEngine
+
+    _, graph = _compile(
+        {
+            "main.sml": """
+            ActionName = GetActionName()
+            Require(rule=f"actions/{ActionName}.sml")
+            """,
+            "actions/guild_joined.sml": "UserId: int = JsonData(path='$.user.id')",
+            "actions/message_sent.sml": "UserId2: int = JsonData(path='$.user.id')",
+        }
+    )
+    schema = {
+        "$schema": "https://discord.dev/smite/action-schema/v1", "action": "guild_joined",
+        "version": 1, "generated_from": {"source": "test", "date": "2026-06-20"},
+        "provides": {"user": {"id": "int"}}, "absent": ["target_user"], "types_used": {}, "optional_for": {},
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for a in ("guild_joined", "message_sent"):
+            (Path(tmp_dir) / f"{a}.json").write_text(json.dumps({**schema, "action": a}))
+        engine = MagicMock(spec=OspreyEngine)
+        engine._execution_graph = graph
+        engine._specialized_graphs = {}
+        engine.get_known_action_names = MagicMock(return_value={"guild_joined", "message_sent"})
+        engine._prune_filter = frozenset({"guild_joined"})  # only this one
+        engine._shadow_filter = frozenset()
+        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir}):
+            OspreyEngine._load_and_register_schemas(engine)
+        registered = [c.args[0] for c in engine.register_specialized_graph.call_args_list]
+        assert registered == ["guild_joined"], registered  # message_sent NOT registered
+
+
+def test_shadow_filter_registers_so_shadow_can_run() -> None:
+    """A shadow-only allowlist still registers the specialized graph (so the engine
+    can run + diff it), even with pruning disabled."""
+    from unittest.mock import MagicMock, patch
+    from osprey.worker.lib.osprey_engine import OspreyEngine
+
+    _, graph = _compile({"main.sml": "UserId: int = JsonData(path='$.user.id')"})
+    schema = {
+        "$schema": "https://discord.dev/smite/action-schema/v1", "action": "guild_joined",
+        "version": 1, "generated_from": {"source": "test", "date": "2026-06-20"},
+        "provides": {"user": {"id": "int"}}, "absent": ["target_user"], "types_used": {}, "optional_for": {},
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        (Path(tmp_dir) / "guild_joined.json").write_text(json.dumps(schema))
+        engine = MagicMock(spec=OspreyEngine)
+        engine._execution_graph = graph
+        engine._specialized_graphs = {}
+        engine.get_known_action_names = MagicMock(return_value={"guild_joined"})
+        engine._prune_filter = frozenset()             # pruning OFF
+        engine._shadow_filter = frozenset({"guild_joined"})  # shadow ON
+        with patch.dict(os.environ, {"OSPREY_SCHEMAS_DIR": tmp_dir}):
+            OspreyEngine._load_and_register_schemas(engine)
+        engine.register_specialized_graph.assert_called_once()
+
+
+def test_shadow_divergences_helper() -> None:
+    """shadow_divergences: equivalent => []; pruned-feature-missing is OK; a
+    spec-only feature, a changed value, or differing effects => divergence."""
+    from types import SimpleNamespace
+    from osprey.engine.executor.graph_specializer import shadow_divergences
+
+    def res(features, effects=None):
+        return SimpleNamespace(extracted_features=features, effects=effects or {})
+
+    # Identical -> no divergence.
+    assert shadow_divergences(res({"UserId": 1}), res({"UserId": 1})) == []
+    # Spec is missing a feature the full graph had (pruned absent group) -> OK.
+    assert shadow_divergences(res({"UserId": 1, "TargetUserId": None}), res({"UserId": 1})) == []
+    # Spec has a feature the full graph didn't -> divergence.
+    assert shadow_divergences(res({"UserId": 1}), res({"UserId": 1, "X": 2}))
+    # Shared feature value changed -> divergence.
+    assert shadow_divergences(res({"UserId": 1}), res({"UserId": 2}))
+    # Effects differ (e.g. a dropped verdict) -> divergence.
+    assert shadow_divergences(res({}, {str: ["v"]}), res({}, {}))
 
 
 # ===========================================================================

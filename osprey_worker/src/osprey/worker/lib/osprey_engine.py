@@ -29,15 +29,18 @@ from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, Mode
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.executor import execute
-from osprey.engine.executor.graph_specializer import specialize_graph
+from osprey.engine.executor.graph_specializer import shadow_divergences, specialize_graph
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.schema.schema_loader import (
     SchemaLoadError,
-    absent_pruning_enabled,
+    filter_includes,
     load_schema_for_action,
+    pruning_action_filter,
     resolve_schemas_dir,
+    shadow_action_filter,
 )
 from osprey.engine.udf.registry import UDFRegistry
+from osprey.worker.lib.instruments import metrics
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
 from osprey.worker.lib.data_exporters.validation_result_exporter import (
@@ -99,6 +102,10 @@ class OspreyEngine:
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
+        # Per-action typed-contract gates (env, read once). _prune_filter: actions
+        # pruned; _shadow_filter: actions run in shadow (full result used + diffed).
+        self._prune_filter = pruning_action_filter()
+        self._shadow_filter = shadow_action_filter()
         # Specialized graphs for typed action contracts (§4.5 runtime dispatch)
         # Maps action_name -> SpecializedExecutionGraph. Populated via register_specialized_graph().
         self._specialized_graphs: Dict[str, ExecutionGraph] = {}
@@ -143,11 +150,12 @@ class OspreyEngine:
         :func:`resolve_schemas_dir` returns ``None`` (neither
         ``OSPREY_SCHEMAS_DIR`` nor ``OSPREY_RULES_PATH/schemas`` resolves).
 
-        Gated behind :func:`absent_pruning_enabled` (OSPREY_TYPED_CONTRACT_PRUNING):
-        runtime pruning stays OFF until explicitly enabled, so shipping schema
-        files on the rules path cannot change behavior on its own.
+        Only registers graphs for actions in the prune OR shadow allowlist
+        (OSPREY_TYPED_CONTRACT_PRUNING / _SHADOW); both default OFF, so shipping
+        schema files on the rules path cannot change behavior on its own.
         """
-        if not absent_pruning_enabled():
+        register_filter = self._prune_filter | self._shadow_filter
+        if not register_filter:
             return
         schemas_dir = resolve_schemas_dir()
         if schemas_dir is None:
@@ -156,6 +164,8 @@ class OspreyEngine:
         action_names = self.get_known_action_names()
         loaded = 0
         for action_name in action_names:
+            if not filter_includes(register_filter, action_name):
+                continue
             try:
                 schema = load_schema_for_action(action_name, schemas_dir)
             except SchemaLoadError as e:
@@ -167,7 +177,8 @@ class OspreyEngine:
             self.register_specialized_graph(action_name, specialized)
             loaded += 1
         if loaded:
-            log.info("Loaded %d specialized graphs from %s", loaded, schemas_dir)
+            log.info("Loaded %d specialized graphs from %s (prune=%r shadow=%r)",
+                     loaded, schemas_dir, sorted(self._prune_filter), sorted(self._shadow_filter))
 
     def _handle_updated_sources(self) -> None:
         try:
@@ -284,19 +295,48 @@ class OspreyEngine:
     ) -> ExecutionResult:
         """Given input action, execute it against the execution engine and return the result.
 
-        If a specialized graph is registered for this action (via register_specialized_graph),
-        that graph is used. Otherwise the default full graph is used (§4.5 runtime dispatch).
-        Schema-less actions incur zero overhead — dict.get is O(1).
+        Dispatch per the typed-contract gates: PRUNE (serve specialized), SHADOW
+        (serve full, compute specialized alongside + diff + metric), else full.
+        Schema-less / non-allowlisted actions incur zero overhead — dict.get is O(1).
         """
-        graph = self._specialized_graphs.get(action.action_name, self._execution_graph)
-        return execute(
-            graph,
-            udf_helpers,
-            action,
-            gevent.pool.Pool(_DEFAULT_MAX_ASYNC_PER_EXECUTION),
-            sample_rate,
-            parent_tracer_span,
+        action_name = action.action_name
+        spec = self._specialized_graphs.get(action_name)
+
+        def _exec(graph: ExecutionGraph) -> ExecutionResult:
+            return execute(
+                graph,
+                udf_helpers,
+                action,
+                gevent.pool.Pool(_DEFAULT_MAX_ASYNC_PER_EXECUTION),
+                sample_rate,
+                parent_tracer_span,
+            )
+
+        if spec is not None and filter_includes(self._prune_filter, action_name):
+            return _exec(spec)
+        if spec is not None and filter_includes(self._shadow_filter, action_name):
+            # Serve the full result; compute specialized alongside, diff, emit a
+            # metric. NOTE: double-executes the action (state-mutating UDFs run for
+            # both passes) — use in canary/staging or for short low-mutation bakes.
+            full_result = _exec(self._execution_graph)
+            try:
+                self._record_shadow(action_name, full_result, _exec(spec))
+            except Exception:
+                log.exception("typed-contract shadow comparison failed for %s", action_name)
+                metrics.increment('osprey.typed_contracts.shadow_error', tags=[f'action:{action_name}'])
+            return full_result
+        return _exec(self._execution_graph)
+
+    @staticmethod
+    def _record_shadow(action_name: str, full_result: ExecutionResult, spec_result: ExecutionResult) -> None:
+        """Diff a shadow run's full vs specialized result and emit a divergence metric."""
+        issues = shadow_divergences(full_result, spec_result)
+        metrics.increment(
+            'osprey.typed_contracts.shadow',
+            tags=[f'action:{action_name}', f'divergent:{str(bool(issues)).lower()}'],
         )
+        if issues:
+            log.warning("typed-contract SHADOW DIVERGENCE for %s: %s", action_name, '; '.join(issues[:8]))
 
     def watch_config_subkey(self, model_class: Type[ModelT], update_callback: Callable[[ModelT], None]) -> None:
         """Register to watch for updates to the given subkey.

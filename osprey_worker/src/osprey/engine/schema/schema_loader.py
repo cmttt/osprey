@@ -14,21 +14,37 @@ log = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = "https://discord.dev/smite/action-schema/v1"
 
-# Activation gate for runtime absent-group pruning. Pruning is a behavior-
-# changing optimization: it removes execution-graph chains for groups a schema
-# declares `absent`. A WRONG `absent` entry on a group that is actually present
-# (the set is fragile — see CollectJsonDataPaths) silently drops features /
-# enforcement. So pruning is OFF unless this env var is explicitly truthy, even
-# when schema files are present on disk. Loading schemas for the compile-time
-# CollectJsonDataPaths warning is unaffected — only the runtime graph
-# specialization is gated.
+# Per-action allowlists (env), so rollout is action-by-action with an env-only kill
+# switch. Both default OFF — a wrong `absent` entry silently drops features/enforcement,
+# so schema files on the rules path do nothing until an action is explicitly listed.
+# PRUNING prunes; SHADOW serves the full result but computes+diffs the specialized one.
 _PRUNING_ENV = "OSPREY_TYPED_CONTRACT_PRUNING"
-_TRUTHY = {"1", "true", "yes", "on"}
+_SHADOW_ENV = "OSPREY_TYPED_CONTRACT_SHADOW"
+_ALL = "*"
+_FALSEY = {"", "0", "false", "no", "off"}
+_TRUTHY = {"1", "true", "yes", "on", "*", "all"}
 
 
-def absent_pruning_enabled() -> bool:
-    """True iff runtime absent-group pruning is explicitly enabled via env."""
-    return os.environ.get(_PRUNING_ENV, "").strip().lower() in _TRUTHY
+def _parse_action_filter(env_name: str) -> FrozenSet[str]:
+    """frozenset() when disabled, {'*'} for all (truthy scalar), else the named actions."""
+    raw = os.environ.get(env_name, "").strip()
+    if raw.lower() in _FALSEY:
+        return frozenset()
+    if raw.lower() in _TRUTHY:
+        return frozenset({_ALL})
+    return frozenset(p.strip() for p in raw.split(",") if p.strip())
+
+
+def pruning_action_filter() -> FrozenSet[str]:
+    return _parse_action_filter(_PRUNING_ENV)
+
+
+def shadow_action_filter() -> FrozenSet[str]:
+    return _parse_action_filter(_SHADOW_ENV)
+
+
+def filter_includes(action_filter: FrozenSet[str], action_name: str) -> bool:
+    return _ALL in action_filter or action_name in action_filter
 
 
 @dataclass(frozen=True)

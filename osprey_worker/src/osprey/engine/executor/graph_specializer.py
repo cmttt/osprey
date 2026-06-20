@@ -44,20 +44,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Node identity = id() of the AST node object.
-#
-# A structural key (source_path, start_line, start_pos, class_name) is NOT unique:
-# CPython gives a mixed-operator boolean expression `A and B or C` two
-# BooleanOperation nodes (the outer Or and inner And) that share the leftmost
-# child's line+col, and Osprey's Span carries no end position to disambiguate
-# them. With a structural key, pruning the inner And (it reads an absent group)
-# would also prune the surviving outer Or (same key) — silently dropping the
-# feature/verdict even when the schema's `absent` set is correct.
-#
-# The specializer and the runtime (SpecializedExecutionGraph) operate on the SAME
-# full_graph AST node objects, and the spec graph is rebuilt against a fresh graph
-# on every recompile, so id() is stable for a specialization's lifetime and
-# collision-free across distinct nodes.
+# Node identity = id() of the AST node. A structural key (source/line/col/class) is
+# NOT unique: `A and B or C` yields an Or and an And node sharing line+col (Span has
+# no end position), so pruning the inner And would also drop the surviving Or. The
+# specializer and runtime share the same full_graph node objects (rebuilt per
+# recompile), so id() is stable for a specialization and collision-free.
 NodeKey = int
 
 
@@ -250,23 +241,14 @@ def specialize_graph(
                     changed = True
                 continue  # Rule chains skip rules (b) and (c)
 
-            # (b) ResolveOptional with a default: keep the ResolveOptional node itself
-            # (so it returns default_value at runtime) but do NOT prune it and do NOT
-            # rescue its optional_value subtree.
-            #
-            # `optional_value` is an Optional kwarg, so UDFBase.resolve_arguments
-            # resolves it with return_none_for_failed_values=True (udf/base.py): a
-            # pruned optional_value resolves to None WITHOUT executing its extractor,
-            # and ResolveOptional.execute returns default_value on None. The old
-            # behavior rescued (un-pruned) the optional_value subtree, which only made
-            # an absent-group extractor RUN and raise ExpectedUdfException before
-            # ResolveOptional defaulted anyway. Skipping the rescue is behavior-
-            # identical (same default value) and eliminates that expected UDF error —
-            # i.e. we no longer evaluate an extractor against a group the schema
-            # guarantees absent. (A ResolveOptional WITHOUT a default is not matched
-            # here; it falls through to rule (c), which prunes it when its only deps
-            # are absent — also behavior-neutral, since it would have raised
-            # ExpectedUdfException and yielded None either way.)
+            # (b) ResolveOptional-with-default: keep it (don't prune), and don't rescue
+            # its optional_value subtree. optional_value is an Optional kwarg, so
+            # resolve_arguments resolves a pruned dep to None WITHOUT running its
+            # extractor (udf/base.py return_none_for_failed_values=True), and execute()
+            # returns the default on None. Rescuing it (the old behavior) only made an
+            # absent-group extractor run and raise ExpectedUdfException before
+            # defaulting anyway — same result, wasted work, spurious expected error.
+            # (Without a default it falls to rule (c): pruned -> None, also neutral.)
             if _is_resolve_optional_chain(chain) and _resolve_optional_has_default(chain):
                 continue
 
@@ -307,6 +289,34 @@ def specialize_graph(
         pruned_keys=frozenset(pruned),
         schema=schema,
     )
+
+
+def shadow_divergences(full_result: object, spec_result: object) -> List[str]:
+    """Divergence reasons between a full and specialized ExecutionResult (empty ==
+    equivalent). A spec feature missing (pruned absent group) is expected; a spec-only
+    feature, a changed shared value, or any effect difference is a real divergence.
+    """
+    issues: List[str] = []
+    ff = getattr(full_result, "extracted_features", {}) or {}
+    sf = getattr(spec_result, "extracted_features", {}) or {}
+    extra = set(sf) - set(ff)
+    if extra:
+        issues.append(f"spec-only features: {sorted(extra)[:10]}")
+    for k in set(ff) & set(sf):
+        if ff[k] != sf[k]:
+            issues.append(f"feature changed: {k} ({ff[k]!r} != {sf[k]!r})")
+
+    def _effects(result: object) -> List[str]:
+        out: List[str] = []
+        for effect_type, seq in (getattr(result, "effects", {}) or {}).items():
+            for effect in seq:
+                out.append(f"{getattr(effect_type, '__name__', effect_type)}:{effect!r}")
+        return sorted(out)
+
+    fe, se = _effects(full_result), _effects(spec_result)
+    if fe != se:
+        issues.append(f"effects differ: full={fe[:6]} spec={se[:6]}")
+    return issues
 
 
 class SpecializedExecutionGraph(ExecutionGraph):
