@@ -540,14 +540,18 @@ def test_conservative_when_all_mixed_presence_prunes_rule() -> None:
     assert "MixedRule" not in result
 
 
-def test_resolve_optional_rescue_scoped_to_dep_tree() -> None:
-    """ResolveOptional rescue only un-prunes chains in its own dep tree.
+def test_resolve_optional_default_prunes_absent_value_with_no_extractor_run() -> None:
+    """ResolveOptional with a default over an absent-group optional_value: the
+    extractor is PRUNED (not rescued), so it never runs and raises no
+    ExpectedUdfException, yet ResolveOptional still returns its default.
 
-    _TargetId is rescued (in the dep tree of ResolveOptional with default).
-    _TargetName stays pruned because it is NOT a dep of the ResolveOptional —
-    it's a separate extractor with no ResolveOptional wrapper.
-    This verifies the BFS only follows the optional_value dep tree.
+    optional_value is an Optional kwarg → resolved with return_none_for_failed_values
+    =True, so a pruned optional_value yields None without executing the extractor, and
+    ResolveOptional.execute returns default on None. (Old behavior rescued the
+    extractor so it RAN and raised an expected error before defaulting.)
     """
+    from osprey.engine.executor.execution_context import ExpectedUdfException
+
     _, graph = _compile(
         {
             "main.sml": """
@@ -557,34 +561,39 @@ def test_resolve_optional_rescue_scoped_to_dep_tree() -> None:
             """,
         }
     )
-    schema = _make_schema(
-        provides={"user": {"id": "int"}},
-        absent=["target_user"],
-    )
+    schema = _make_schema(provides={"user": {"id": "int"}}, absent=["target_user"])
     specialized = specialize_graph(graph, schema)
-    pruned_keys = specialized._pruned_keys
-    # The graph has exactly:
-    #   - _TargetId: 2 chains (Call + Assign) → rescued by ResolveOptional rescue
-    #   - _TargetName: 2 chains (Call + Assign) → NOT rescued (not in dep tree)
-    #   - TargetIdOrZero: 2 chains (Call + Assign) → NOT pruned (ResolveOptional with default)
-    # So exactly 2 chains should be pruned (_TargetName's Call + Assign).
-    # _TargetId chains are rescued (removed from pruned set).
-    assert specialized.pruned_count == 2, (
-        f"Expected exactly 2 pruned chains (_TargetName Call + Assign), "
-        f"got {specialized.pruned_count}: {pruned_keys}"
-    )
-    # All pruned chains should be Assign or Call (not the ResolveOptional chain).
+
+    # Both absent-group extractors are pruned; the ResolveOptional itself is NOT.
     pruned_classes = {
         type(c.executor.node).__name__
         for c in _collect_all_chains_recursive(_get_all_sorted_chains(graph))
-        if _node_key_from_chain(c) in pruned_keys
+        if _node_key_from_chain(c) in specialized._pruned_keys
     }
+    assert specialized.pruned_count >= 2, f"absent extractors should be pruned; got {specialized.pruned_count}"
     assert pruned_classes <= {"Assign", "Call", "Boolean"}, f"Unexpected pruned node types: {pruned_classes}"
-    # Execution must succeed and return the default for TargetIdOrZero.
-    result = _run_graph(specialized, {"user": {"id": 1}})
+
+    # Count ExpectedUdfException raised during execution — must be ZERO (no absent
+    # extractor runs). This is the expected-UDF-error elimination the prune delivers.
+    raised = {"n": 0}
+    orig = ExpectedUdfException.__init__
+
+    def _counting(self, *a, **k):
+        raised["n"] += 1
+        orig(self, *a, **k)
+
+    ExpectedUdfException.__init__ = _counting  # type: ignore[method-assign]
+    try:
+        result = _run_graph(specialized, {"user": {"id": 1}})
+    finally:
+        ExpectedUdfException.__init__ = orig  # type: ignore[method-assign]
+
+    # Behavior preserved: default returned; pruned extractors absent from output.
     assert result.get("TargetIdOrZero") == 0
-    # _TargetName is pruned so it should not appear in results.
     assert "_TargetName" not in result
+    assert "_TargetId" not in result
+    # The whole point: no expected UDF error was manufactured by an absent extractor.
+    assert raised["n"] == 0, f"expected ZERO ExpectedUdfException, got {raised['n']}"
 
 
 def test_specialized_graphs_cleared_on_source_reload() -> None:

@@ -250,24 +250,24 @@ def specialize_graph(
                     changed = True
                 continue  # Rule chains skip rules (b) and (c)
 
-            # (b) ResolveOptional with default: don't prune even if optional_value dep
-            # is pruned — the node will return default_value at runtime.
-            # Rescue the pruned dep chain (optional_value) and its transitive deps,
-            # stopping at chains that are not pruned or are constants.
-            # `rescued` prevents re-visiting nodes in diamond-shaped dependency graphs.
+            # (b) ResolveOptional with a default: keep the ResolveOptional node itself
+            # (so it returns default_value at runtime) but do NOT prune it and do NOT
+            # rescue its optional_value subtree.
+            #
+            # `optional_value` is an Optional kwarg, so UDFBase.resolve_arguments
+            # resolves it with return_none_for_failed_values=True (udf/base.py): a
+            # pruned optional_value resolves to None WITHOUT executing its extractor,
+            # and ResolveOptional.execute returns default_value on None. The old
+            # behavior rescued (un-pruned) the optional_value subtree, which only made
+            # an absent-group extractor RUN and raise ExpectedUdfException before
+            # ResolveOptional defaulted anyway. Skipping the rescue is behavior-
+            # identical (same default value) and eliminates that expected UDF error —
+            # i.e. we no longer evaluate an extractor against a group the schema
+            # guarantees absent. (A ResolveOptional WITHOUT a default is not matched
+            # here; it falls through to rule (c), which prunes it when its only deps
+            # are absent — also behavior-neutral, since it would have raised
+            # ExpectedUdfException and yielded None either way.)
             if _is_resolve_optional_chain(chain) and _resolve_optional_has_default(chain):
-                to_rescue: List[DependencyChain] = list(deps)
-                rescued: Set[NodeKey] = set()
-                while to_rescue:
-                    dep = to_rescue.pop()
-                    dep_key = _node_key_from_chain(dep)
-                    if dep_key in rescued:
-                        continue
-                    rescued.add(dep_key)
-                    if dep_key in pruned:
-                        pruned.discard(dep_key)
-                        changed = True
-                        to_rescue.extend(dep.dependent_on)
                 continue
 
             # (c) Default propagation: prune if ALL non-constant deps are pruned.
