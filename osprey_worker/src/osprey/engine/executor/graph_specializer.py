@@ -297,8 +297,10 @@ def shadow_divergences(full_result: object, spec_result: object) -> List[str]:
     feature, a changed shared value, or any effect difference is a real divergence.
     """
     issues: List[str] = []
-    ff = getattr(full_result, "extracted_features", {}) or {}
-    sf = getattr(spec_result, "extracted_features", {}) or {}
+    # Exclude engine-injected features (e.g. __error_count): pruning legitimately
+    # changes them, which would otherwise flag every real prune as a divergence.
+    ff = {k: v for k, v in (getattr(full_result, "extracted_features", {}) or {}).items() if not k.startswith("__")}
+    sf = {k: v for k, v in (getattr(spec_result, "extracted_features", {}) or {}).items() if not k.startswith("__")}
     extra = set(sf) - set(ff)
     if extra:
         issues.append(f"spec-only features: {sorted(extra)[:10]}")

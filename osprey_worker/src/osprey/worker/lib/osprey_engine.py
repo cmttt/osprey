@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from time import time
 from typing import Callable, Dict, Generic, List, Optional, Set, Tuple, Type, TypeVar

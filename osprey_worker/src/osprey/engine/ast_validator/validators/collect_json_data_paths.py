@@ -9,6 +9,7 @@ where action_name is derived from `actions/<name>.sml` paths.
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from osprey.engine.ast import grammar
 from osprey.engine.ast.ast_utils import filter_nodes
-from osprey.engine.ast.grammar import Assign, Call, Name, Source, Span
+from osprey.engine.ast.grammar import Assign, Call, Source, Span
 from osprey.engine.ast_validator.base_validator import BaseValidator, HasResult
 from osprey.engine.ast_validator.validators.imports_must_not_have_cycles import ImportsMustNotHaveCycles
 from osprey.engine.ast_validator.validators.validate_call_kwargs import ValidateCallKwargs
@@ -140,7 +141,17 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
         self._import_graph = import_result.import_graph
 
     def run(self) -> None:
-        """For each action source, compute the reachable closure and collect fields."""
+        """For each action source, compute the reachable closure and collect fields.
+
+        Advisory only (emits warnings); guarded so an unexpected AST shape can never
+        fail rule compilation fleet-wide — degrade to whatever manifest we collected.
+        """
+        try:
+            self._collect_fields_and_cross_check()
+        except Exception:
+            log.exception("CollectJsonDataPaths failed; skipping typed-contract cross-check")
+
+    def _collect_fields_and_cross_check(self) -> None:
         # Action sources are those under actions/<name>.sml
         action_sources = [
             source
@@ -357,7 +368,9 @@ class CollectJsonDataPaths(BaseValidator, HasResult[ActionManifest]):
                     )
                     continue  # No further checks needed for absent fields
 
-                path_key = field.path.removeprefix("$.")
+                # Strip array indices ($.a[0].b -> a.b) so the lookup matches the
+                # flattened dotted key in provides_field_types.
+                path_key = re.sub(r"\[[^\]]*\]", "", field.path.removeprefix("$."))
 
                 # Check 2: type mismatch (only for fields in a provided group)
                 declared = schema.provides_field_types.get(path_key)
