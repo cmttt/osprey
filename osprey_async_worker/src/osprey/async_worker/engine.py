@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
 
 from ddtrace.span import Span as TracerSpan
+from osprey.async_worker.executor import execute as async_execute
 from osprey.engine.ast.ast_utils import iter_nodes
 from osprey.engine.ast.grammar import Assign, Span, parsed_ast_root_cache
 from osprey.engine.ast.sources import Sources, SourcesConfig
@@ -38,24 +39,22 @@ from osprey.engine.ast_validator.validators.validate_static_types import (
 from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, ModelT
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
-from osprey.engine.executor.graph_specializer import shadow_divergences, specialize_graph
+from osprey.engine.executor.typed_contract_dispatch import (
+    load_and_register_specialized_graphs,
+    record_shadow,
+    resolve_dispatch,
+)
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.schema.schema_loader import (
-    SchemaLoadError,
-    filter_includes,
-    load_schema_for_action,
     pruning_action_filter,
-    resolve_schemas_dir,
     shadow_action_filter,
 )
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.worker.lib.instruments import metrics
+from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.sources_config import get_config_registry
 from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
-
-from osprey.async_worker.executor import execute as async_execute
-from osprey.worker.lib.singletons import CONFIG
 
 log = logging.getLogger(__name__)
 
@@ -340,33 +339,16 @@ class AsyncOspreyEngine:
 
         Only registers graphs for actions in the prune OR shadow allowlist
         (OSPREY_TYPED_CONTRACT_PRUNING / _SHADOW); both default OFF, so shipping
-        schema files on the rules path cannot change behavior on its own.
+        schema files on the rules path cannot change behavior on its own. The shared
+        loop lives in `typed_contract_dispatch` (identical to the gevent engine).
         """
-        register_filter = self._prune_filter | self._shadow_filter
-        if not register_filter:
-            return
-        schemas_dir = resolve_schemas_dir()
-        if schemas_dir is None:
-            return
-
-        action_names = self.get_known_action_names()
-        loaded = 0
-        for action_name in action_names:
-            if not filter_includes(register_filter, action_name):
-                continue
-            try:
-                schema = load_schema_for_action(action_name, schemas_dir)
-            except SchemaLoadError as e:
-                log.warning("Failed to load schema for %s: %s", action_name, e)
-                continue
-            if schema is None:
-                continue
-            specialized = specialize_graph(self._execution_graph, schema)
-            self.register_specialized_graph(action_name, specialized)
-            loaded += 1
-        if loaded:
-            log.info("Loaded %d specialized graphs from %s (prune=%r shadow=%r)",
-                     loaded, schemas_dir, sorted(self._prune_filter), sorted(self._shadow_filter))
+        load_and_register_specialized_graphs(
+            self._execution_graph,
+            self._prune_filter,
+            self._shadow_filter,
+            self.get_known_action_names,
+            self.register_specialized_graph,
+        )
 
     async def execute(
         self,
@@ -382,48 +364,28 @@ class AsyncOspreyEngine:
                 'OSPREY_MAX_ASYNC_PER_EXECUTION', _DEFAULT_MAX_ASYNC_PER_EXECUTION
             )
         action_name = action.action_name
-        spec = self._specialized_graphs.get(action_name)
-        if spec is not None and filter_includes(self._prune_filter, action_name):
+
+        async def _run(graph: ExecutionGraph) -> ExecutionResult:
             return await async_execute(
-                spec, udf_helpers, action,
+                graph, udf_helpers, action,
                 max_concurrent=max_concurrent, sample_rate=sample_rate,
                 parent_tracer_span=parent_tracer_span,
             )
-        if spec is not None and filter_includes(self._shadow_filter, action_name):
+
+        serve_graph, shadow_spec = resolve_dispatch(
+            action_name, self._specialized_graphs, self._prune_filter,
+            self._shadow_filter, self._execution_graph,
+        )
+        result = await _run(serve_graph)
+        if shadow_spec is not None:
             # Shadow DOUBLE-EXECUTES (state-mutating UDFs run twice) — use in canary/
-            # staging or a short low-mutation bake. The full result is what's served.
-            full_result = await async_execute(
-                self._execution_graph, udf_helpers, action,
-                max_concurrent=max_concurrent, sample_rate=sample_rate,
-                parent_tracer_span=parent_tracer_span,
-            )
+            # staging or a short low-mutation bake; the served result is the full graph's.
             try:
-                spec_result = await async_execute(
-                    spec, udf_helpers, action,
-                    max_concurrent=max_concurrent, sample_rate=sample_rate,
-                    parent_tracer_span=parent_tracer_span,
-                )
-                self._record_shadow(action_name, full_result, spec_result)
+                record_shadow(action_name, result, await _run(shadow_spec))
             except Exception:
                 log.exception("typed-contract shadow comparison failed for %s", action_name)
                 metrics.increment('osprey.typed_contracts.shadow_error', tags=[f'action:{action_name}'])
-            return full_result
-        return await async_execute(
-            self._execution_graph, udf_helpers, action,
-            max_concurrent=max_concurrent, sample_rate=sample_rate,
-            parent_tracer_span=parent_tracer_span,
-        )
-
-    @staticmethod
-    def _record_shadow(action_name: str, full_result: ExecutionResult, spec_result: ExecutionResult) -> None:
-        """Diff a shadow run's full vs specialized result and emit a metric."""
-        issues = shadow_divergences(full_result, spec_result)
-        metrics.increment(
-            'osprey.typed_contracts.shadow',
-            tags=[f'action:{action_name}', f'divergent:{str(bool(issues)).lower()}'],
-        )
-        if issues:
-            log.warning("typed-contract SHADOW DIVERGENCE for %s: %s", action_name, '; '.join(issues[:8]))
+        return result
 
     def get_config_subkey(self, model_class: Type[ModelT]) -> ModelT:
         return self._config_subkey_handler.get_config_subkey(model_class)

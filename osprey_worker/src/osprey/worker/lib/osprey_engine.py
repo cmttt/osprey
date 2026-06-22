@@ -29,24 +29,24 @@ from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, Mode
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.executor import execute
-from osprey.engine.executor.graph_specializer import shadow_divergences, specialize_graph
+from osprey.engine.executor.typed_contract_dispatch import (
+    load_and_register_specialized_graphs,
+    record_shadow,
+    resolve_dispatch,
+)
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
 from osprey.engine.schema.schema_loader import (
-    SchemaLoadError,
-    filter_includes,
-    load_schema_for_action,
     pruning_action_filter,
-    resolve_schemas_dir,
     shadow_action_filter,
 )
 from osprey.engine.udf.registry import UDFRegistry
-from osprey.worker.lib.instruments import metrics
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
 from osprey.worker.lib.data_exporters.validation_result_exporter import (
     BaseValidationResultExporter,
     NullValidationResultExporter,
 )
+from osprey.worker.lib.instruments import metrics
 from osprey.worker.lib.sources_config import get_config_registry
 from osprey.worker.lib.utils.input_stream_ready_signaler import InputStreamReadySignaler
 from pydantic.main import BaseModel
@@ -152,33 +152,16 @@ class OspreyEngine:
 
         Only registers graphs for actions in the prune OR shadow allowlist
         (OSPREY_TYPED_CONTRACT_PRUNING / _SHADOW); both default OFF, so shipping
-        schema files on the rules path cannot change behavior on its own.
+        schema files on the rules path cannot change behavior on its own. The shared
+        loop lives in `typed_contract_dispatch` (identical to the async engine).
         """
-        register_filter = self._prune_filter | self._shadow_filter
-        if not register_filter:
-            return
-        schemas_dir = resolve_schemas_dir()
-        if schemas_dir is None:
-            return
-
-        action_names = self.get_known_action_names()
-        loaded = 0
-        for action_name in action_names:
-            if not filter_includes(register_filter, action_name):
-                continue
-            try:
-                schema = load_schema_for_action(action_name, schemas_dir)
-            except SchemaLoadError as e:
-                log.warning("Failed to load schema for %s: %s", action_name, e)
-                continue
-            if schema is None:
-                continue
-            specialized = specialize_graph(self._execution_graph, schema)
-            self.register_specialized_graph(action_name, specialized)
-            loaded += 1
-        if loaded:
-            log.info("Loaded %d specialized graphs from %s (prune=%r shadow=%r)",
-                     loaded, schemas_dir, sorted(self._prune_filter), sorted(self._shadow_filter))
+        load_and_register_specialized_graphs(
+            self._execution_graph,
+            self._prune_filter,
+            self._shadow_filter,
+            self.get_known_action_names,
+            self.register_specialized_graph,
+        )
 
     def _handle_updated_sources(self) -> None:
         try:
@@ -300,7 +283,6 @@ class OspreyEngine:
         Schema-less / non-allowlisted actions incur zero overhead — dict.get is O(1).
         """
         action_name = action.action_name
-        spec = self._specialized_graphs.get(action_name)
 
         def _exec(graph: ExecutionGraph) -> ExecutionResult:
             return execute(
@@ -312,31 +294,20 @@ class OspreyEngine:
                 parent_tracer_span,
             )
 
-        if spec is not None and filter_includes(self._prune_filter, action_name):
-            return _exec(spec)
-        if spec is not None and filter_includes(self._shadow_filter, action_name):
-            # Serve the full result; compute specialized alongside, diff, emit a
-            # metric. NOTE: double-executes the action (state-mutating UDFs run for
-            # both passes) — use in canary/staging or for short low-mutation bakes.
-            full_result = _exec(self._execution_graph)
+        serve_graph, shadow_spec = resolve_dispatch(
+            action_name, self._specialized_graphs, self._prune_filter,
+            self._shadow_filter, self._execution_graph,
+        )
+        result = _exec(serve_graph)
+        if shadow_spec is not None:
+            # Shadow DOUBLE-EXECUTES (state-mutating UDFs run for both passes) — use in
+            # canary/staging or a short low-mutation bake; the served result is the full graph's.
             try:
-                self._record_shadow(action_name, full_result, _exec(spec))
+                record_shadow(action_name, result, _exec(shadow_spec))
             except Exception:
                 log.exception("typed-contract shadow comparison failed for %s", action_name)
                 metrics.increment('osprey.typed_contracts.shadow_error', tags=[f'action:{action_name}'])
-            return full_result
-        return _exec(self._execution_graph)
-
-    @staticmethod
-    def _record_shadow(action_name: str, full_result: ExecutionResult, spec_result: ExecutionResult) -> None:
-        """Diff a shadow run's full vs specialized result and emit a divergence metric."""
-        issues = shadow_divergences(full_result, spec_result)
-        metrics.increment(
-            'osprey.typed_contracts.shadow',
-            tags=[f'action:{action_name}', f'divergent:{str(bool(issues)).lower()}'],
-        )
-        if issues:
-            log.warning("typed-contract SHADOW DIVERGENCE for %s: %s", action_name, '; '.join(issues[:8]))
+        return result
 
     def watch_config_subkey(self, model_class: Type[ModelT], update_callback: Callable[[ModelT], None]) -> None:
         """Register to watch for updates to the given subkey.
@@ -427,7 +398,11 @@ def bootstrap_engine_with_helpers(
     sources_provider: Optional[BaseSourcesProvider] = None,
 ) -> Tuple[OspreyEngine, UDFHelpers]:
     # Avoid circular imports
-    from osprey.worker.adaptor.plugin_manager import bootstrap_ast_validators, bootstrap_udfs, bootstrap_validation_exporter
+    from osprey.worker.adaptor.plugin_manager import (
+        bootstrap_ast_validators,
+        bootstrap_udfs,
+        bootstrap_validation_exporter,
+    )
 
     udf_registry, udf_helpers = bootstrap_udfs()
     bootstrap_ast_validators()

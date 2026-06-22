@@ -760,6 +760,7 @@ def test_load_and_register_schemas_noop_when_env_unset() -> None:
 
     engine = MagicMock(spec=OspreyEngine)
     engine._specialized_graphs = {}
+    engine._execution_graph = MagicMock()
     engine._prune_filter = frozenset({"*"})  # gates enabled...
     engine._shadow_filter = frozenset()
 
@@ -792,6 +793,7 @@ def test_load_and_register_schemas_noop_when_pruning_disabled() -> None:
         (Path(tmp_dir) / "guild_joined.json").write_text(json.dumps(valid_schema))
         engine = MagicMock(spec=OspreyEngine)
         engine._specialized_graphs = {}
+        engine._execution_graph = MagicMock()
         engine.get_known_action_names = MagicMock(return_value={"guild_joined"})
         # Schema dir IS set, but both gates are empty (default) -> no registration.
         engine._prune_filter = frozenset()
