@@ -14,7 +14,6 @@ from osprey.engine.schema.schema_loader import (
 )
 
 _VALID_SCHEMA = {
-    "$schema": "https://discord.dev/smite/action-schema/v1",
     "action": "guild_joined",
     "version": 1,
     "generated_from": {
@@ -63,7 +62,7 @@ class TestSchemaLoader:
 
     def test_missing_schema_version_raises(self, tmp_path: Path) -> None:
         bad = dict(_VALID_SCHEMA)
-        bad["$schema"] = "wrong"
+        bad["version"] = 99
         path = _write_schema(tmp_path, bad)
         with pytest.raises(SchemaLoadError, match="Unsupported schema version"):
             load_schema(path)
@@ -188,7 +187,6 @@ class TestSchemaLoader:
 
     def test_schema_with_no_provides_and_no_absent(self, tmp_path: Path) -> None:
         minimal = {
-            "$schema": "https://discord.dev/smite/action-schema/v1",
             "action": "minimal_action",
             "version": 1,
             "generated_from": {"source": "hand-authored", "date": "2026-05-25", "authored_by": "test"},

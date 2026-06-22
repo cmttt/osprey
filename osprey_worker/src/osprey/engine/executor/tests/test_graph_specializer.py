@@ -888,8 +888,10 @@ def test_shadow_filter_registers_so_shadow_can_run() -> None:
 
 
 def test_shadow_divergences_helper() -> None:
-    """shadow_divergences: equivalent => []; pruned-feature-missing is OK; a
-    spec-only feature, a changed value, or differing effects => divergence."""
+    """shadow_divergences is an ENFORCEMENT bar (effects + decision keys), not a
+    feature-key bar: pruned/changed non-decision features are OK; a spec-only feature,
+    a changed decision key, or differing effects => divergence. Time-variant effect
+    description metadata is normalized out."""
     from types import SimpleNamespace
     from osprey.engine.executor.graph_specializer import shadow_divergences
 
@@ -900,12 +902,26 @@ def test_shadow_divergences_helper() -> None:
     assert shadow_divergences(res({"UserId": 1}), res({"UserId": 1})) == []
     # Spec is missing a feature the full graph had (pruned absent group) -> OK.
     assert shadow_divergences(res({"UserId": 1, "TargetUserId": None}), res({"UserId": 1})) == []
-    # Spec has a feature the full graph didn't -> divergence.
+    # Spec ADDED a feature the full graph didn't (pruning must only remove) -> divergence.
     assert shadow_divergences(res({"UserId": 1}), res({"UserId": 1, "X": 2}))
-    # Shared feature value changed -> divergence.
-    assert shadow_divergences(res({"UserId": 1}), res({"UserId": 2}))
+    # A changed NON-decision feature value is NOT an enforcement divergence (feature-key bar;
+    # this is exactly the absent-group False->None case the RFC correction allows).
+    assert shadow_divergences(res({"UserId": 1}), res({"UserId": 2})) == []
+    # A changed DECISION key IS a divergence.
+    assert shadow_divergences(res({"__verdicts": ["ban"]}), res({"__verdicts": []}))
     # Effects differ (e.g. a dropped verdict) -> divergence.
     assert shadow_divergences(res({}, {str: ["v"]}), res({}, {}))
+
+    # Effects differing ONLY in time-variant description metadata -> NOT a divergence.
+    class _Eff:
+        def __init__(self, age: str) -> None:
+            self.age = age
+
+        def __repr__(self) -> str:
+            return "LabelEffect(name='ban', value=True, features={'_AccountAge': '%s'})" % self.age
+
+    assert shadow_divergences(res({}, {str: [_Eff("171261810.97")]}),
+                              res({}, {str: [_Eff("171261811.00")]})) == []
 
 
 # ===========================================================================
@@ -1059,3 +1075,57 @@ def test_resolved_keyerror_for_non_pruned_node_still_raises() -> None:
     # NodeFailurePropagationException — the fix must not mask real bugs.
     with pytest.raises(KeyError):
         ctx.resolved(never_executed_node, return_none_for_failed_values=False)
+
+
+def test_required_false_truthy_when_absent_condition_overprunes_rule() -> None:
+    """Hole C (KNOWN LIMITATION, pinned): conservative Rule pruning over-prunes when a
+    `required=False` field in a GENUINELY-absent group feeds a comparison that is TRUE
+    when the field is None (`!=`, `== None`, `is None`).
+
+    Full graph: the `required=False` extractor returns None (not a failure), so
+    `None != "spam"` evaluates True; with the other when_all conditions satisfied the
+    Rule fires and the verdict is emitted. The specialized graph prunes the extractor
+    (rule c) -> prunes the comparison (rule c) -> conservatively prunes the Rule (rule a),
+    silently dropping the verdict.
+
+    This differs from `required=True` (absent -> extractor FAILS -> comparison fails ->
+    rule does not fire -> pruning is equivalent; see the Hole-B test) and from the
+    `==`/falsy-when-None case (rule does not fire either way). It is the truthy-when-None
+    dual of the None-vs-False question: today the engine fabricates `True` for
+    `None != const`, the rule fires, and pruning changes fire->no-fire.
+
+    Impact today: LATENT -- the all-232-action in-process sweep found 0 such live cases,
+    and pruning is default-off. But it is a real missed-enforcement mechanism. A correct
+    fix is a `required`-aware specializer change (rescue, rather than prune, the when_all
+    subtree of a required=False extractor so it computes None->comparison at runtime).
+    Until then: do NOT enable pruning for any action whose rules read a required=False
+    field of one of its absent groups in a truthy-when-None comparison.
+    """
+    _, graph = _compile_effect(
+        {
+            'main.sml': """
+            _TargetName: Optional[str] = JsonData(path='$.target_user.name', required=False)
+            UserId: int = JsonData(path='$.user.id')
+            TargetNotSpam: bool = _TargetName != "spam"
+            UserIsBad: bool = UserId == 42
+            BanRule = Rule(when_all=[TargetNotSpam, UserIsBad], description='ban')
+            WhenRules(rules_any=[BanRule], then=[DeclareVerdict(verdict="ban")])
+            """,
+        }
+    )
+    schema = _make_schema(provides={'user': {'id': 'int'}}, absent=['target_user'])
+    specialized = specialize_graph(graph, schema)
+    payload = {'user': {'id': 42}}  # target_user GENUINELY absent
+
+    full_verdicts = [v.verdict for v in _run_graph_full_result(graph, payload).verdicts]
+    spec_result = _run_graph_full_result(specialized, payload)
+    spec_verdicts = [v.verdict for v in spec_result.verdicts]
+
+    # Full graph fires (None != "spam" is True).
+    assert full_verdicts == ['ban'], f'full graph should ban; got {full_verdicts}'
+    # KNOWN LIMITATION: specialized graph silently drops the verdict (over-prune).
+    # When the required-aware rescue lands, flip this to `== ['ban']`.
+    assert spec_verdicts == [], f'pinned over-prune divergence changed; got {spec_verdicts}'
+    # The drop must at least be silent-but-clean (no KeyError leak).
+    for ei in spec_result.error_infos:
+        assert not isinstance(ei.error, KeyError), f'KeyError leaked: {ei.error}'

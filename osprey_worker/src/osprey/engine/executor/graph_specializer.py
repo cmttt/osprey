@@ -29,6 +29,7 @@ Node identity: NodeKey = id(ast_node) — collision-free (see NodeKey definition
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, FrozenSet, List, Optional, Sequence, Set
 
 from osprey.engine.ast.grammar import ASTNode, IsConstant, List as GrammarList, Source
@@ -291,28 +292,46 @@ def specialize_graph(
     )
 
 
+# RuleT carries a `features={...}` dict used only to render the human-readable label
+# description; it can embed time-variant values (e.g. _AccountAge = SnowflakeAge(now()))
+# and never affects enforcement. Strip it before comparing effects so a ~ms drift
+# between the full and specialized passes is not mistaken for a divergence.
+_EFFECT_DESC_META = re.compile(r"features=\{[^}]*\}")
+# The enforcement-determining decision outputs (engine-injected, `__`-prefixed).
+_DECISION_KEYS = ("__verdicts", "__classifications", "__entity_label_mutations")
+
+
 def shadow_divergences(full_result: object, spec_result: object) -> List[str]:
-    """Divergence reasons between a full and specialized ExecutionResult (empty ==
-    equivalent). A spec feature missing (pruned absent group) is expected; a spec-only
-    feature, a changed shared value, or any effect difference is a real divergence.
+    """ENFORCEMENT-divergence reasons between a full and specialized ExecutionResult
+    (empty == equivalent).
+
+    The bar is *enforcement equivalence* — emitted effects plus the decision keys — NOT
+    feature-key identity. A pruned absent-group feature legitimately disappears, and an
+    absent-group `: bool` feature legitimately becomes None instead of a fabricated False,
+    so a changed/absent non-decision feature value is EXPECTED, not a divergence (matching
+    the in-process equivalence harness and the RFC's "Pruning Semantics & Validation").
+    Two things are still real bugs: a spec-only feature (pruning must only REMOVE, never
+    ADD) and any change to the effects or decision outputs. Time-variant effect description
+    metadata is normalized out (see `_EFFECT_DESC_META`).
     """
     issues: List[str] = []
-    # Exclude engine-injected features (e.g. __error_count): pruning legitimately
-    # changes them, which would otherwise flag every real prune as a divergence.
-    ff = {k: v for k, v in (getattr(full_result, "extracted_features", {}) or {}).items() if not k.startswith("__")}
-    sf = {k: v for k, v in (getattr(spec_result, "extracted_features", {}) or {}).items() if not k.startswith("__")}
-    extra = set(sf) - set(ff)
+    ff = getattr(full_result, "extracted_features", {}) or {}
+    sf = getattr(spec_result, "extracted_features", {}) or {}
+    # Pruning must only ever REMOVE features, never add them.
+    extra = sorted(k for k in (set(sf) - set(ff)) if not k.startswith("__"))
     if extra:
-        issues.append(f"spec-only features: {sorted(extra)[:10]}")
-    for k in set(ff) & set(sf):
-        if ff[k] != sf[k]:
-            issues.append(f"feature changed: {k} ({ff[k]!r} != {sf[k]!r})")
+        issues.append(f"spec-only features: {extra[:10]}")
+    # Enforcement decision outputs must be identical.
+    for k in _DECISION_KEYS:
+        if ff.get(k) != sf.get(k):
+            issues.append(f"decision changed: {k} ({ff.get(k)!r} != {sf.get(k)!r})")
 
     def _effects(result: object) -> List[str]:
         out: List[str] = []
         for effect_type, seq in (getattr(result, "effects", {}) or {}).items():
             for effect in seq:
-                out.append(f"{getattr(effect_type, '__name__', effect_type)}:{effect!r}")
+                rendered = f"{getattr(effect_type, '__name__', effect_type)}:{effect!r}"
+                out.append(_EFFECT_DESC_META.sub("features=<desc>", rendered))
         return sorted(out)
 
     fe, se = _effects(full_result), _effects(spec_result)

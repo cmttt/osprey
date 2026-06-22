@@ -12,7 +12,7 @@ from typing import Dict, FrozenSet, List, Optional, Set
 
 log = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = "https://discord.dev/smite/action-schema/v1"
+_SUPPORTED_VERSION = 1
 
 # Per-action allowlists (env), so rollout is action-by-action with an env-only kill
 # switch. Both default OFF — a wrong `absent` entry silently drops features/enforcement,
@@ -86,11 +86,11 @@ def load_schema(schema_path: Path, schemas_dir: Optional[Path] = None) -> Action
     except json.JSONDecodeError as e:
         raise SchemaLoadError(f"Invalid JSON in {schema_path}: {e}")
 
-    schema_val = raw.get("$schema", "")
-    if schema_val != _SCHEMA_VERSION:
+    version = raw.get("version")
+    if version != _SUPPORTED_VERSION:
         raise SchemaLoadError(
-            f"Unsupported schema version in {schema_path}: {schema_val!r}. "
-            f"Expected {_SCHEMA_VERSION!r}."
+            f"Unsupported schema version in {schema_path}: {version!r}. "
+            f"Expected {_SUPPORTED_VERSION!r}."
         )
 
     action = raw.get("action", "")
