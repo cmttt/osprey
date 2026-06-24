@@ -29,7 +29,16 @@ from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, Mode
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
 from osprey.engine.executor.executor import execute
+from osprey.engine.executor.typed_contract_dispatch import (
+    load_and_register_specialized_graphs,
+    record_shadow,
+    resolve_dispatch,
+)
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
+from osprey.engine.schema.schema_loader import (
+    pruning_action_filter,
+    shadow_action_filter,
+)
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.engine.utils.types import add_slots
@@ -37,6 +46,7 @@ from osprey.worker.lib.data_exporters.validation_result_exporter import (
     BaseValidationResultExporter,
     NullValidationResultExporter,
 )
+from osprey.worker.lib.instruments import metrics
 from osprey.worker.lib.sources_config import get_config_registry
 from osprey.worker.lib.utils.input_stream_ready_signaler import InputStreamReadySignaler
 from pydantic.main import BaseModel
@@ -92,6 +102,14 @@ class OspreyEngine:
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
+        # Per-action typed-contract gates (env, read once). _prune_filter: actions
+        # pruned; _shadow_filter: actions run in shadow (full result used + diffed).
+        self._prune_filter = pruning_action_filter()
+        self._shadow_filter = shadow_action_filter()
+        # Specialized graphs for typed action contracts (§4.5 runtime dispatch)
+        # Maps action_name -> SpecializedExecutionGraph. Populated via register_specialized_graph().
+        self._specialized_graphs: Dict[str, ExecutionGraph] = {}
+        self._load_and_register_schemas()
 
     def _compile_execution_graph(self, disable_periodic_yield: bool = False) -> ExecutionGraph:
         def _do_compile_execution_graph() -> ExecutionGraph:
@@ -124,22 +142,61 @@ class OspreyEngine:
 
         return self._execution_graph_compilation_thread_pool.apply(_do_compile_execution_graph)
 
+    def _load_and_register_schemas(self) -> None:
+        """Load schemas from the resolved schemas directory and register
+        specialized graphs.
+
+        Called after every compilation (init + reload). No-op if
+        :func:`resolve_schemas_dir` returns ``None`` (neither
+        ``OSPREY_SCHEMAS_DIR`` nor ``OSPREY_RULES_PATH/schemas`` resolves).
+
+        Only registers graphs for actions in the prune OR shadow allowlist
+        (OSPREY_TYPED_CONTRACT_PRUNING / _SHADOW); both default OFF, so shipping
+        schema files on the rules path cannot change behavior on its own. The shared
+        loop lives in `typed_contract_dispatch` (identical to the async engine).
+        """
+        load_and_register_specialized_graphs(
+            self._execution_graph,
+            self._prune_filter,
+            self._shadow_filter,
+            self.get_known_action_names,
+            self.register_specialized_graph,
+        )
+
     def _handle_updated_sources(self) -> None:
-        # noinspection PyBroadException
         try:
-            self._execution_graph = self._compile_execution_graph()
-            log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+            new_graph = self._compile_execution_graph()
         except Exception:
             log.exception(
                 f'Failed to compile execution graph for sources={self._sources_provider.get_current_sources().hash()}'
             )
-        else:
-            # Only do this if no exception occurred above
-            self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
-            # Confirm to the provider which sources are now live so it dedups no-op
-            # re-deliveries against what we applied; the except branch above leaves
-            # it unmarked, so a failed compile retries on the next re-delivery.
-            self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
+            return  # Leave existing graph + specialized graphs intact
+
+        # Maintain dispatch-observable consistency across the graph swap.
+        # Invariant: _specialized_graphs always contains graphs backed by the
+        # CURRENT _execution_graph, or is empty.  Empty is always safe because
+        # execute() falls back to _execution_graph.
+        #
+        # Observable state transitions (sequential, no intermediate inconsistency):
+        #   (old_graph, old_specialized)   — before reload
+        #   (old_graph, {})                — after clear, before assign
+        #   (new_graph, {})                — after assign, before reload
+        #   (new_graph, new_specialized)   — after reload
+        #
+        # A concurrent execute() that sees (old_graph, {}) runs the full old graph —
+        # correct.  A concurrent execute() that sees (new_graph, {}) runs the full
+        # new graph — also correct.  The previous ordering (assign then clear) could
+        # expose (new_graph, old_specialized), which is never correct.
+        self._specialized_graphs.clear()
+        self._execution_graph = new_graph
+        log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+
+        self._load_and_register_schemas()
+        self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
+        # Confirm to the provider which sources are now live so it dedups no-op
+        # re-deliveries against what we applied; the early return above leaves
+        # it unmarked, so a failed compile retries on the next re-delivery.
+        self._sources_provider.mark_sources_applied(self._execution_graph.validated_sources.sources.hash())
 
         # noinspection PyBroadException
         # try to send validation results, should not block osprey_engine if this fails
@@ -203,6 +260,15 @@ class OspreyEngine:
         """Returns a mapping from 'rule name' -> 'rule description' for each feature that is a rule declaration."""
         return self._execution_graph.validated_sources.get_validator_result(RuleNameToDescriptionMapping)
 
+    def register_specialized_graph(self, action_name: str, graph: ExecutionGraph) -> None:
+        """Register a specialized execution graph for a given action name.
+
+        When execute() is called for this action_name, the specialized graph will
+        be used instead of the default graph (§4.5 runtime dispatch).
+        """
+        self._specialized_graphs[action_name] = graph
+        log.info("Registered specialized graph for action %r", action_name)
+
     def execute(
         self,
         udf_helpers: UDFHelpers,
@@ -210,15 +276,38 @@ class OspreyEngine:
         sample_rate: int = 100,
         parent_tracer_span: Optional[TracerSpan] = None,
     ) -> ExecutionResult:
-        """Given input action, execute it against the execution engine and return the result."""
-        return execute(
-            self._execution_graph,
-            udf_helpers,
-            action,
-            gevent.pool.Pool(_DEFAULT_MAX_ASYNC_PER_EXECUTION),
-            sample_rate,
-            parent_tracer_span,
+        """Given input action, execute it against the execution engine and return the result.
+
+        Dispatch per the typed-contract gates: PRUNE (serve specialized), SHADOW
+        (serve full, compute specialized alongside + diff + metric), else full.
+        Schema-less / non-allowlisted actions incur zero overhead — dict.get is O(1).
+        """
+        action_name = action.action_name
+
+        def _exec(graph: ExecutionGraph) -> ExecutionResult:
+            return execute(
+                graph,
+                udf_helpers,
+                action,
+                gevent.pool.Pool(_DEFAULT_MAX_ASYNC_PER_EXECUTION),
+                sample_rate,
+                parent_tracer_span,
+            )
+
+        serve_graph, shadow_spec = resolve_dispatch(
+            action_name, self._specialized_graphs, self._prune_filter,
+            self._shadow_filter, self._execution_graph, action_data=action.data,
         )
+        result = _exec(serve_graph)
+        if shadow_spec is not None:
+            # Shadow DOUBLE-EXECUTES (state-mutating UDFs run for both passes) — use in
+            # canary/staging or a short low-mutation bake; the served result is the full graph's.
+            try:
+                record_shadow(action_name, result, _exec(shadow_spec))
+            except Exception:
+                log.exception("typed-contract shadow comparison failed for %s", action_name)
+                metrics.increment('osprey.typed_contracts.shadow_error', tags=[f'action:{action_name}'])
+        return result
 
     def watch_config_subkey(self, model_class: Type[ModelT], update_callback: Callable[[ModelT], None]) -> None:
         """Register to watch for updates to the given subkey.
@@ -309,7 +398,11 @@ def bootstrap_engine_with_helpers(
     sources_provider: Optional[BaseSourcesProvider] = None,
 ) -> Tuple[OspreyEngine, UDFHelpers]:
     # Avoid circular imports
-    from osprey.worker.adaptor.plugin_manager import bootstrap_ast_validators, bootstrap_udfs, bootstrap_validation_exporter
+    from osprey.worker.adaptor.plugin_manager import (
+        bootstrap_ast_validators,
+        bootstrap_udfs,
+        bootstrap_validation_exporter,
+    )
 
     udf_registry, udf_helpers = bootstrap_udfs()
     bootstrap_ast_validators()

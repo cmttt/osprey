@@ -190,6 +190,14 @@ class HasLabel(
 
             validation_context.add_error(message='unknown label', span=arguments.label.argument_span, hint=hint)
 
+    # NOTE: HasLabel does NOT declare is_fold_safe_when_absent. Its `entity` is a non-optional
+    # EntityT, and an EntityT cannot hold a None id (entities.py), so an entity extracted from an
+    # absent group always fails (Err) — which shadows HasLabel before any absent_value could apply,
+    # and means HasLabel never makes a labels-service call for an absent entity in the first place
+    # (resolve_arguments fails on the entity Err). The absent_value hook (udf/base.py) is for UDFs
+    # whose primary input is OPTIONAL (so it folds to a real None, not Err) — e.g. counters/IP
+    # lookups keyed on an optional value, which live in the discord_smite plugins.
+
     def _check_error_on_empty(
         self, entity: EntityT[Any], label: str, entity_labels: EntityLabels, error_on_empty: bool
     ) -> None:

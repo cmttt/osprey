@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from osprey.worker.lib.data_exporters.validation_result_exporter import BaseValidationResultExporter
 
 from ddtrace.span import Span as TracerSpan
+from osprey.async_worker.executor import execute as async_execute
 from osprey.engine.ast.ast_utils import iter_nodes
 from osprey.engine.ast.grammar import Assign, Span, parsed_ast_root_cache
 from osprey.engine.ast.sources import Sources, SourcesConfig
@@ -38,15 +39,22 @@ from osprey.engine.ast_validator.validators.validate_static_types import (
 from osprey.engine.config.config_subkey_handler import ConfigSubkeyHandler, ModelT
 from osprey.engine.executor.execution_context import Action, ExecutionResult
 from osprey.engine.executor.execution_graph import ExecutionGraph, compile_execution_graph
+from osprey.engine.executor.typed_contract_dispatch import (
+    load_and_register_specialized_graphs,
+    record_shadow,
+    resolve_dispatch,
+)
 from osprey.engine.executor.udf_execution_helpers import UDFHelpers
+from osprey.engine.schema.schema_loader import (
+    pruning_action_filter,
+    shadow_action_filter,
+)
 from osprey.engine.udf.registry import UDFRegistry
 from osprey.engine.utils.periodic_execution_yielder import periodic_execution_yield
 from osprey.worker.lib.instruments import metrics
+from osprey.worker.lib.singletons import CONFIG
 from osprey.worker.lib.sources_config import get_config_registry
 from osprey.worker.lib.sources_provider_base import BaseSourcesProvider
-
-from osprey.async_worker.executor import execute as async_execute
-from osprey.worker.lib.singletons import CONFIG
 
 log = logging.getLogger(__name__)
 
@@ -104,7 +112,19 @@ class AsyncOspreyEngine:
         self._sources_provider.set_sources_watcher(self._handle_updated_sources)
         self._config_subkey_handler = ConfigSubkeyHandler(config_registry, self._execution_graph.validated_sources)
         self._validation_result_exporter = validation_exporter
+        # Per-action typed-contract gates (env, read once — env is stable per process).
+        # _prune_filter: actions whose graph is pruned. _shadow_filter: actions run in
+        # shadow (full result used, specialized computed + diffed).
+        self._prune_filter = pruning_action_filter()
+        self._shadow_filter = shadow_action_filter()
+        # Specialized graphs for typed action contracts (§4.5 runtime dispatch).
+        # Maps action_name -> SpecializedExecutionGraph.  Populated via
+        # register_specialized_graph() during init + every source reload.
+        self._specialized_graphs: Dict[str, ExecutionGraph] = {}
+        self._load_and_register_schemas()
         # Freeze the boot graph out of gen-2 GC (see _freeze_resident_graph).
+        # Runs AFTER schema load so the specialized graphs are frozen into the
+        # permanent generation too (mirrors the reload path ordering).
         self._freeze_resident_graph()
 
     def _compile_execution_graph_sync(self, yield_during_compile: bool = True) -> ExecutionGraph:
@@ -197,7 +217,14 @@ class AsyncOspreyEngine:
         # memoizes ast_root by Source content, so unchanged source files share
         # the same ast_root between graphs. Nulling parents on shared nodes
         # would corrupt the new graph's AST.
+        #
+        # Typed-action-contracts dispatch order (mirrors osprey_engine.py):
+        # _specialized_graphs is cleared BEFORE _execution_graph is swapped,
+        # so any in-flight execute() observes one of the consistent states:
+        #   (old, old_specialized) → (old, {}) → (new, {}) → (new, new_specialized)
+        # and never (new_graph, stale_specialized_backed_by_old_graph).
         old_graph = self._execution_graph
+        self._specialized_graphs.clear()
         self._execution_graph = new_graph
 
         # Confirm to the provider which sources are now actually live so it dedups
@@ -207,6 +234,19 @@ class AsyncOspreyEngine:
         self._sources_provider.mark_sources_applied(new_graph.validated_sources.sources.hash())
 
         log.info(f'Compiled new execution graph for sources={self._sources_provider.get_current_sources().hash()}')
+
+        # Reload typed-action-contracts specialized graphs against the new full
+        # graph. Hoisted off the event loop because specialize_graph walks every
+        # chain in the full graph and, scaled across all schema'd actions
+        # (~hundreds), would block the bridge loop the sources-watcher trampoline
+        # runs on. During the window between _specialized_graphs.clear() above
+        # and re-population here, execute() correctly falls back to the new
+        # full graph for schema'd actions — the dispatch is `dict.get(name,
+        # _execution_graph)`, so a partially-populated dict is consistent.
+        await asyncio.get_running_loop().run_in_executor(
+            self._thread_pool, self._load_and_register_schemas
+        )
+
         self._config_subkey_handler.dispatch_config(self._execution_graph.validated_sources)
 
         if self._validation_result_exporter is not None:
@@ -276,6 +316,40 @@ class AsyncOspreyEngine:
     def config(self) -> SourcesConfig:
         return self._execution_graph.validated_sources.sources.config
 
+    def register_specialized_graph(self, action_name: str, graph: ExecutionGraph) -> None:
+        """Register a specialized execution graph for a given action name.
+
+        When execute() is called for this action_name, the specialized graph
+        will be used instead of the default graph (§4.5 runtime dispatch).
+        Mirrors OspreyEngine.register_specialized_graph in the gevent variant.
+        """
+        self._specialized_graphs[action_name] = graph
+        log.info("Registered specialized graph for action %r", action_name)
+
+    def _load_and_register_schemas(self) -> None:
+        """Load schemas from the resolved schemas directory and register
+        specialized graphs.
+
+        Synchronous, CPU-heavy: each ``specialize_graph`` call walks every
+        chain in the full graph. On the reload path this is dispatched via
+        ``run_in_executor`` to keep the bridge loop responsive.
+
+        No-op if :func:`resolve_schemas_dir` returns ``None``. Mirrors
+        :meth:`OspreyEngine._load_and_register_schemas` in the gevent variant.
+
+        Only registers graphs for actions in the prune OR shadow allowlist
+        (OSPREY_TYPED_CONTRACT_PRUNING / _SHADOW); both default OFF, so shipping
+        schema files on the rules path cannot change behavior on its own. The shared
+        loop lives in `typed_contract_dispatch` (identical to the gevent engine).
+        """
+        load_and_register_specialized_graphs(
+            self._execution_graph,
+            self._prune_filter,
+            self._shadow_filter,
+            self.get_known_action_names,
+            self.register_specialized_graph,
+        )
+
     async def execute(
         self,
         udf_helpers: UDFHelpers,
@@ -289,14 +363,29 @@ class AsyncOspreyEngine:
             max_concurrent = CONFIG.instance().get_int(
                 'OSPREY_MAX_ASYNC_PER_EXECUTION', _DEFAULT_MAX_ASYNC_PER_EXECUTION
             )
-        return await async_execute(
-            self._execution_graph,
-            udf_helpers,
-            action,
-            max_concurrent=max_concurrent,
-            sample_rate=sample_rate,
-            parent_tracer_span=parent_tracer_span,
+        action_name = action.action_name
+
+        async def _run(graph: ExecutionGraph) -> ExecutionResult:
+            return await async_execute(
+                graph, udf_helpers, action,
+                max_concurrent=max_concurrent, sample_rate=sample_rate,
+                parent_tracer_span=parent_tracer_span,
+            )
+
+        serve_graph, shadow_spec = resolve_dispatch(
+            action_name, self._specialized_graphs, self._prune_filter,
+            self._shadow_filter, self._execution_graph, action_data=action.data,
         )
+        result = await _run(serve_graph)
+        if shadow_spec is not None:
+            # Shadow DOUBLE-EXECUTES (state-mutating UDFs run twice) — use in canary/
+            # staging or a short low-mutation bake; the served result is the full graph's.
+            try:
+                record_shadow(action_name, result, await _run(shadow_spec))
+            except Exception:
+                log.exception("typed-contract shadow comparison failed for %s", action_name)
+                metrics.increment('osprey.typed_contracts.shadow_error', tags=[f'action:{action_name}'])
+        return result
 
     def get_config_subkey(self, model_class: Type[ModelT]) -> ModelT:
         return self._config_subkey_handler.get_config_subkey(model_class)

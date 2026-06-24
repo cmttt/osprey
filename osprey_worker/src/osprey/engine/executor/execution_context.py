@@ -157,6 +157,10 @@ class ExecutionContext:
         self._outputs: Dict[str, Any] = {}
         self._pending_executions: Set[DependencyChain] = set()
         self._resolved_node_values: Dict[int, NodeResult] = {}
+        # Seed any precomputed (constant-folded) node values for a specialized graph, so folded
+        # absent-group nodes resolve to their constant without being scheduled or executed. Empty
+        # for a full graph. Keyed by id(node), matching set_resolved_value's keying.
+        self._resolved_node_values.update(execution_graph.get_prefolded_node_values())
         self._visited_executions: Set[DependencyChain] = set()
         # a k/v store of effects, by effect type
         self._effects: DefaultDict[Type[EffectBase], List[EffectBase]] = defaultdict(list)
@@ -198,6 +202,13 @@ class ExecutionContext:
                 return None
             else:
                 raise NodeFailurePropagationException()
+        except KeyError:
+            if self._execution_graph.is_pruned_node(node):
+                if return_none_for_failed_values:
+                    return None
+                else:
+                    raise NodeFailurePropagationException()
+            raise
 
     def get_name_node(self, name: Name) -> ASTNode:
         """Returns the node that is responsible for resolving a given Loaded name."""
@@ -248,11 +259,23 @@ class ExecutionContext:
     def enqueue_source(self, source: Source) -> None:
         sorted_dependency_chain = self._execution_graph.get_sorted_dependency_chain(source)
 
+        # Build the set of chain ids that will actually be in the DAG (includes
+        # previously enqueued chains).  Predecessors that are NOT in this set
+        # were pruned by a SpecializedExecutionGraph and must not be registered
+        # as dependencies — the TopologicalSorter would otherwise wait for them
+        # forever since pruned chains are never marked done().
+        known_chain_ids: Set[int] = set(self._chain_by_id.keys())
+        for chain in sorted_dependency_chain:
+            known_chain_ids.add(id(chain))
+
         for chain in sorted_dependency_chain:
             chainid = id(chain)
             if self._dependency_dag.already_added(chainid):
                 continue
-            self._dependency_dag.add(chainid, *(id(pred) for pred in chain.dependent_on))
+            live_pred_ids = tuple(
+                id(pred) for pred in chain.dependent_on if id(pred) in known_chain_ids
+            )
+            self._dependency_dag.add(chainid, *live_pred_ids)
             self._chain_by_id[chainid] = chain
 
         self._dependency_dag.prepare()
